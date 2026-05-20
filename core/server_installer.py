@@ -103,32 +103,59 @@ class ServerInstaller:
 
     def install_neoforge(self, target_path, mc_version, java_cmd="java"):
         """下载并自动安装 NeoForge 服务端 (针对 1.20.1+)"""
-        print(f"正在获取 NeoForge {mc_version} 版本信息...")
+        print(f"正在自动获取 NeoForge {mc_version} 的最新构建...")
         try:
-            # NeoForge 使用 Maven 结构，我们可以尝试猜测或从其 API 获取
-            # 简化版：直接从其官方 Maven 获取最新构建（NeoForge 版本号通常就是 mc版本.构建号）
-            # 例如 1.21.1 对应 21.1.x
-            # 这里我们使用一个简单的探测逻辑
-            major_ver = mc_version.split('.')[1] if '.' in mc_version else "21"
-            # 注意：此逻辑在 NeoForge 官网有更复杂的 API，这里先做一个基础适配
-            api_url = f"https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml"
-            # 实际生产中建议解析 XML 找到最匹配 mc_version 的版本
-            # 为简化测试，我们先提示用户此功能需要更精确的 API 接入
-            print("  [提示] NeoForge 下载目前需要精准匹配版本号，正在尝试自动匹配...")
-            
-            # 这里先以 1.21.1 常用版本为例
-            if mc_version == "1.21.1":
-                full_version = "21.1.53" # 示例版本
-            else:
-                print(f"  [错误] 目前 NeoForge 自动安装仅适配了特定测试版本，请手动确认。")
+            # 1. 获取所有版本列表
+            api_url = "https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml"
+            r = requests.get(api_url, timeout=10)
+            if r.status_code != 200:
+                print("  [错误] 无法连接到 NeoForge Maven 仓库。")
                 return False
+
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(r.text)
+            all_versions = [v.text for v in root.findall(".//version")]
+
+            # 2. 映射版本前缀
+            # NeoForge 命名规则:
+            # 1.20.1 -> 47.1.x
+            # 1.20.2 -> 20.2.x
+            # 1.20.4 -> 20.4.x
+            # 1.20.6 -> 20.6.x
+            # 1.21   -> 21.0.x
+            # 1.21.1 -> 21.1.x
+            prefix = ""
+            if mc_version == "1.20.1":
+                prefix = "47.1."
+            else:
+                parts = mc_version.split('.')
+                # 1.21 -> 21.0, 1.21.1 -> 21.1
+                minor = parts[1]
+                patch = parts[2] if len(parts) > 2 else "0"
+                prefix = f"{minor}.{patch}."
+
+            # 3. 筛选出符合前缀的最新版本 (排除 beta/alpha)
+            matching_versions = [v for v in all_versions if v.startswith(prefix) and "-" not in v]
+            if not matching_versions:
+                # 尝试包含 beta (有些版本可能只有 beta)
+                matching_versions = [v for v in all_versions if v.startswith(prefix)]
+            
+            if not matching_versions:
+                print(f"  [错误] 未找到适用于 {mc_version} 的 NeoForge 版本。")
+                return False
+
+            # 取最后一位作为最新版
+            full_version = matching_versions[-1]
+            print(f"  已找到最新 NeoForge 版本: {full_version}")
 
             dl_url = f"https://maven.neoforged.net/releases/net/neoforged/neoforge/{full_version}/neoforge-{full_version}-installer.jar"
             
+            # 4. 下载安装器
             if not self._download(dl_url, target_path, "neoforge-installer.jar"):
                 return False
             
-            print("正在执行 NeoForge 静默安装...")
+            # 5. 执行静默安装
+            print("正在执行 NeoForge 静默安装 (请耐心等待...)...")
             import subprocess
             result = subprocess.run(
                 [java_cmd, "-jar", "neoforge-installer.jar", "--installServer"],
@@ -143,10 +170,12 @@ class ServerInstaller:
                 return True
             else:
                 print(f"  [错误] NeoForge 安装失败。")
+                # 打印错误详情，NeoForge 有时候对 Java 版本要求极高
+                print(f"  调试信息: {result.stderr[:200]}...")
                 return False
 
         except Exception as e:
-            print(f"  [错误] NeoForge 下载/安装异常: {e}")
+            print(f"  [错误] NeoForge 自动化流程异常: {e}")
             return False
 
     def _cleanup(self, target_path, installer_name):

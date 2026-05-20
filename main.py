@@ -70,7 +70,7 @@ def main():
     if version_ge(mc_version, "1.14"):
         available_options.append(("Fabric (现代模组服)", "Fabric"))
     
-    if version_ge(mc_version, "1.20.1"):
+    if version_ge(mc_version, "1.20.2"):
         available_options.append(("NeoForge (新一代模组服)", "NeoForge"))
 
     print("\n请选择服务端类型:")
