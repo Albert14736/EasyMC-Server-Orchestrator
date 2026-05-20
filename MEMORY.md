@@ -17,9 +17,10 @@
 *   **同步机制**: 只有在 `自动脚本` 中的功能测试通过，且用户明确下达“同步”或“发布”指令后，才能将代码复制到 `我的世界自动开服软件` 准备提交 GitHub。
 *   **路径锁定**: 强制使用 `SCRIPT_DIR` 获取脚本物理路径，确保服务器文件夹始终在脚本同级目录生成。
 *   **Java 匹配**: macOS 使用 `java_home` 锁定版本；Windows 未来需适配注册表路径或 `where` 命令。
-*   **API 逻辑**: 使用 Modrinth V2 API，通过 `game_versions` 和 `loaders` 参数进行过滤。
+*   **API 逻辑**: 使用 Modrinth V2 API，通过 `game_versions` 和 `loaders` 参数进行过滤。已升级至 v2.1，支持模糊匹配和多加载器回退。
 
-## 4. 待办与后续目标
+## 4. 遗留问题与待办
+*   **模组同步盲点**: TAB, FerriteCore, Connectivity 在 Modrinth API 中由于标签不规范导致同步率较低 (目前 12/15)。由于当前硬件环境（i7-13700HX/U9-285K）性能过剩，暂不急于死磕这三个模组，待后续优化。
 *   [ ] **Windows 兼容性优化**: 增加 `.bat` 启动脚本支持。
 *   [ ] **GUI 开发**: 基于 Python (PyQt6/Tkinter) 构建可视化操作界面。
 *   [ ] **高级编辑器**: 可视化编辑 `server.properties`。
