@@ -26,7 +26,11 @@
 *   详见 `WINDOWS_PLAN.md`。
 
 ## 5. 遗留问题与待办
-*   **模组同步盲点**: TAB, FerriteCore, Connectivity 在 Modrinth API 中由于标签不规范导致同步率较低 (目前 12/15)。由于当前硬件环境（i7-13700HX/U9-285K）性能过剩，暂不急于死磕这三个模组，待后续优化。
+*   ~~**模组同步盲点**: TAB, FerriteCore, Connectivity 在 Modrinth API 中由于标签不规范导致同步率较低~~ → **2026-05-23 审计澄清**：根本不是标签问题，是 ID 错了。`audit_mod_database.py` 跑了一遍 17 个条目：
+    - TAB / FerriteCore / NeoEssentials 三个**ID 完全错误**，已用真实 Modrinth ID 替换
+    - EntityCulling 实际是客户端专属（`server_side=unsupported`），已从 DB 剔除
+    - Connectivity 在 Modrinth 上不存在，疑似只在 CurseForge，已剔除并等 Phase 4 CF 集成时回填
+    - 详见 `MOD_DATABASE.md` 末尾的"已剔除条目"小节
 *   [ ] **GUI 按钮断点**: 首页"开启服务器"、版本管理"启动"按钮未绑 command。
 *   [ ] **Windows 兼容性**: `.bat` 启动脚本 + 注册表 Java 检测 + 抽离 POSIX-only 调用。
 *   [ ] **高级编辑器**: 可视化编辑 `server.properties`。
