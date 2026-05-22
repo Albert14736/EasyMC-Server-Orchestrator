@@ -124,6 +124,12 @@ class ImportResult:
     files_installed: int = 0
     files_skipped_client: int = 0
     files_failed: int = 0
+    # CurseForge mods whose authors opted out of the public API but which we
+    # downloaded via the public forgecdn CDN as a fallback (same approach
+    # HMCL/PrismLauncher use). Each entry: {"name": ..., "cf_url": ...}.
+    # Surfaced to the GUI so the user knows this happened and can support
+    # the author at the listed CF page if they want.
+    bypassed_mods: List[dict] = field(default_factory=list)
 
 
 class ModpackProvider(ABC):

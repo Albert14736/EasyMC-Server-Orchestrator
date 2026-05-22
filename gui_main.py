@@ -631,16 +631,21 @@ class ModpackImportWindow(ctk.CTkToplevel):
                 print(f"[警告] 写入实例注册表失败：{e}")
 
             for w in self.body.winfo_children(): w.destroy()
-            ctk.CTkLabel(self.body, text="🎉", font=ctk.CTkFont(size=44)).pack(pady=(30, 8))
+            ctk.CTkLabel(self.body, text="🎉", font=ctk.CTkFont(size=40)).pack(pady=(18, 4))
             ctk.CTkLabel(self.body, text="导入完成",
                          font=ctk.CTkFont(size=18, weight="bold")).pack()
             summary = (f"安装文件: {result.files_installed}   "
                        f"跳过客户端: {result.files_skipped_client}   "
                        f"失败: {result.files_failed}")
-            ctk.CTkLabel(self.body, text=summary, text_color="gray").pack(pady=8)
+            ctk.CTkLabel(self.body, text=summary, text_color="gray").pack(pady=6)
             ctk.CTkLabel(self.body, text=result.server_path,
                          text_color="#888", font=ctk.CTkFont(size=11)).pack()
-            row = ctk.CTkFrame(self.body, fg_color="transparent"); row.pack(pady=20)
+            # Transparent bypass notice — explain that we used the same trick
+            # HMCL / PrismLauncher / etc use, so users understand and can
+            # support authors if they want.
+            if result.bypassed_mods:
+                self._render_bypass_notice(result.bypassed_mods)
+            row = ctk.CTkFrame(self.body, fg_color="transparent"); row.pack(pady=14)
             ctk.CTkButton(row, text="去版本管理查看", width=160,
                           fg_color="#2b719e", hover_color="#1f538d",
                           command=lambda: (self.destroy(), self.master.show_versions())).pack(side="left", padx=8)
@@ -649,6 +654,45 @@ class ModpackImportWindow(ctk.CTkToplevel):
         else:
             self._show_fatal(f"导入失败：{result.error or '未知错误'}\n\n"
                              f"已下载 {result.files_installed}，失败 {result.files_failed}。")
+
+    def _render_bypass_notice(self, bypassed):
+        """Honest disclosure: these mods' authors opted out of third-party API
+        but we downloaded via CDN anyway (same as HMCL / PrismLauncher).
+        Showing them lets the user choose to support those authors at CF."""
+        wrap = ctk.CTkFrame(self.body, fg_color="#2a2415", corner_radius=10,
+                            border_width=1, border_color="#7a6520")
+        wrap.pack(fill="x", padx=20, pady=(10, 4))
+        n = len(bypassed)
+        ctk.CTkLabel(
+            wrap,
+            text=f"ℹ️ 有 {n} 个 mod 是用备用方式下载的",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#e0c97a",
+        ).pack(anchor="w", padx=12, pady=(8, 2))
+        ctk.CTkLabel(
+            wrap,
+            text=("这些 mod 的作者在 CurseForge 设置了"
+                  "「只允许用官方启动器下载」。HMSL 跟 HMCL 等主流启动器一样，"
+                  "通过备用链接帮你装好了。如果你喜欢这些 mod，"
+                  "建议去对应页面给作者点支持："),
+            text_color="#bbb", font=ctk.CTkFont(size=11),
+            wraplength=620, justify="left",
+        ).pack(anchor="w", padx=12, pady=(0, 4))
+        # Scrollable so 20+ mods don't blow out the window
+        listframe = ctk.CTkScrollableFrame(wrap, height=min(140, 24 * n + 10),
+                                            fg_color="transparent")
+        listframe.pack(fill="x", padx=8, pady=(0, 8))
+        for m in bypassed:
+            line = ctk.CTkFrame(listframe, fg_color="transparent")
+            line.pack(fill="x", anchor="w")
+            ctk.CTkLabel(line, text=f"  • {m.get('name', '?')}",
+                         text_color="#ddd",
+                         font=ctk.CTkFont(size=11), anchor="w").pack(side="left")
+            url = m.get("cf_url", "")
+            if url:
+                ctk.CTkLabel(line, text=url, text_color="#6f9fd0",
+                             font=ctk.CTkFont(size=10),
+                             anchor="w").pack(side="left", padx=(8, 0))
 
 
 def _default_name_from(modpack_name: str) -> str:

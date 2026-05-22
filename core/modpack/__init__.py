@@ -15,14 +15,18 @@ import os
 from typing import Callable, List, Optional
 
 from .base import ImportProgress, ImportResult, ModpackManifest, ModpackProvider
+from .curseforge import CurseForgeProvider
 from .modrinth import ModrinthProvider
 
 
 # Order matters: provider list is tried top-to-bottom. Put the most specific
 # detectors first (Modrinth's distinct .mrpack extension is the easiest tell).
+# CurseForge uses generic .zip but its detect() reads manifest.json's
+# "manifestType" field so false positives are negligible.
 PROVIDERS: List[ModpackProvider] = [
     ModrinthProvider(),
-    # Future providers go here: CurseForgeProvider(), MultiMCProvider(), ...
+    CurseForgeProvider(),
+    # Future providers go here: MultiMCProvider(), MCBBSProvider(), ...
 ]
 
 
