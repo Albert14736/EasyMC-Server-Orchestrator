@@ -1,0 +1,6 @@
+customtkinter>=5.2.0
+requests>=2.31.0
+tkinterdnd2>=0.4.0
+
+# Dev only
+pytest>=8.0.0

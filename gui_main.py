@@ -11,7 +11,19 @@ from core.mod_downloader import ModDownloader
 from core.server_factory import create_server
 from core.launcher import start_server
 from core.instance_registry import InstanceRegistry, RegistryEntry
-from core.mod_scanner import scan_server_mods, disable_mods, ScanReport
+from core.mod_scanner import scan_server_mods, disable_mods, ScanReport, find_mods_dir
+from core import modrinth_search as ms
+from core import modpack as mp
+
+# Drag-and-drop is provided by tkinterdnd2. It's optional — if the package
+# isn't installed, the GUI still works, you just can't drag files in.
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    _DND_AVAILABLE = True
+except ImportError:
+    _DND_AVAILABLE = False
+    DND_FILES = None
+    TkinterDnD = None
 from instance_scanner_test import InstanceScanner # 导入扫描器
 
 # 设置外观主题
@@ -230,9 +242,435 @@ class ModScanWindow(ctk.CTkToplevel):
         ctk.CTkButton(top, text="知道了", width=100, command=top.destroy).pack()
 
 
-class HMSLApp(ctk.CTk):
+class ConfirmDialog(ctk.CTkToplevel):
+    """简单模态确认弹窗：返回 True/False，给 GUI 决定是否继续敏感操作。"""
+    def __init__(self, master, title, msg, ok_text="继续", cancel_text="取消", danger=False):
+        super().__init__(master)
+        self.title(title); self.geometry("440x220")
+        self.result = False
+        ctk.CTkLabel(self, text=title, font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(20, 8))
+        ctk.CTkLabel(self, text=msg, wraplength=400, text_color="gray").pack(padx=20)
+        row = ctk.CTkFrame(self, fg_color="transparent"); row.pack(pady=20)
+        ctk.CTkButton(row, text=cancel_text, width=110, fg_color="#3d3d3d",
+                      hover_color="#4d4d4d", command=self._cancel).pack(side="left", padx=8)
+        ctk.CTkButton(row, text=ok_text, width=110,
+                      fg_color=("#a13b3b" if danger else "#2b719e"),
+                      hover_color=("#823030" if danger else "#1f538d"),
+                      command=self._ok).pack(side="left", padx=8)
+        self.transient(master); self.grab_set()
+
+    def _ok(self):   self.result = True;  self.destroy()
+    def _cancel(self): self.result = False; self.destroy()
+
+
+class ModBrowserWindow(ctk.CTkToplevel):
+    """HMCL 式模组搜索浏览器：搜 Modrinth → 一键安装到服务器 mods/plugins。"""
+
+    PAGE_SIZE = 15
+
+    def __init__(self, master, server_name, server_path, mc_version=None, loader=None):
+        super().__init__(master)
+        self.title(f"下载模组 - {server_name}")
+        self.geometry("840x620")
+        self.server_name = server_name
+        self.server_path = server_path
+        self.mc_version = mc_version
+        self.loader = loader
+        self.offset = 0
+        self.current_query = ""
+        self._installing_buttons = {}  # button -> hit, so we can re-enable
+
+        # Project type: Paper -> plugin, others -> mod
+        self.project_type = "plugin" if (loader and loader.lower() == "paper") else "mod"
+
+        ctk.CTkLabel(self, text=f"📥 下载模组: {server_name}",
+                     font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(15, 4))
+        filter_text = []
+        if mc_version: filter_text.append(f"版本 {mc_version}")
+        if loader:     filter_text.append(loader)
+        filter_text.append(f"类型 {self.project_type}")
+        ctk.CTkLabel(self, text="过滤: " + " / ".join(filter_text) + ("" if filter_text else " (无过滤)"),
+                     text_color="gray", font=ctk.CTkFont(size=11)).pack()
+
+        # Search row
+        search_row = ctk.CTkFrame(self, fg_color="transparent")
+        search_row.pack(fill="x", padx=20, pady=10)
+        self.search_var = ctk.StringVar()
+        entry = ctk.CTkEntry(search_row, textvariable=self.search_var,
+                             placeholder_text="搜索关键字（留空浏览热门）")
+        entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        entry.bind("<Return>", lambda e: self._do_search(0))
+        ctk.CTkButton(search_row, text="搜索", width=80, command=lambda: self._do_search(0)).pack(side="left")
+
+        # Result area
+        self.results_frame = ctk.CTkScrollableFrame(self, width=780, height=420, fg_color="transparent")
+        self.results_frame.pack(padx=20, pady=4, fill="both", expand=True)
+
+        # Pagination bar
+        page_row = ctk.CTkFrame(self, fg_color="transparent")
+        page_row.pack(fill="x", padx=20, pady=(0, 10))
+        self.prev_btn = ctk.CTkButton(page_row, text="◀ 上一页", width=100, state="disabled",
+                                       fg_color="#3d3d3d", hover_color="#4d4d4d",
+                                       command=lambda: self._do_search(max(0, self.offset - self.PAGE_SIZE)))
+        self.prev_btn.pack(side="left", padx=4)
+        self.next_btn = ctk.CTkButton(page_row, text="下一页 ▶", width=100, state="disabled",
+                                       fg_color="#3d3d3d", hover_color="#4d4d4d",
+                                       command=lambda: self._do_search(self.offset + self.PAGE_SIZE))
+        self.next_btn.pack(side="left", padx=4)
+        self.page_label = ctk.CTkLabel(page_row, text="", text_color="gray")
+        self.page_label.pack(side="left", padx=12)
+        ctk.CTkButton(page_row, text="关闭", width=80, fg_color="#3d3d3d", hover_color="#4d4d4d",
+                      command=self.destroy).pack(side="right")
+
+        # Initial fetch (empty query → relevance ranking returns popular mods)
+        self._do_search(0)
+
+    def _do_search(self, offset):
+        self.current_query = self.search_var.get().strip()
+        self.offset = offset
+        # Clear results, show "loading"
+        for w in self.results_frame.winfo_children(): w.destroy()
+        ctk.CTkLabel(self.results_frame, text="正在搜索…", text_color="gray").pack(pady=80)
+        self.prev_btn.configure(state="disabled")
+        self.next_btn.configure(state="disabled")
+        self.page_label.configure(text="")
+        threading.Thread(target=self._run_search, daemon=True).start()
+
+    def _run_search(self):
+        try:
+            page = ms.search_mods(
+                query=self.current_query,
+                mc_version=self.mc_version,
+                loader=self.loader,
+                project_type=self.project_type,
+                offset=self.offset,
+                limit=self.PAGE_SIZE,
+            )
+        except Exception as e:
+            self.after(0, lambda: self._show_msg(f"搜索失败：{e}"))
+            return
+        self.after(0, lambda: self._render_page(page))
+
+    def _show_msg(self, msg):
+        for w in self.results_frame.winfo_children(): w.destroy()
+        ctk.CTkLabel(self.results_frame, text=msg, text_color="#e07a5f").pack(pady=80)
+
+    def _render_page(self, page):
+        for w in self.results_frame.winfo_children(): w.destroy()
+        if not page.hits:
+            ctk.CTkLabel(self.results_frame, text="没有匹配结果。试试别的关键字？",
+                         text_color="gray").pack(pady=80)
+            self.page_label.configure(text=f"共 0 个结果")
+            return
+        for hit in page.hits:
+            self._add_hit_card(hit)
+        # Pagination
+        end = page.offset + len(page.hits)
+        self.page_label.configure(text=f"共 {page.total_hits} 个结果  ·  显示 {page.offset + 1}-{end}")
+        self.prev_btn.configure(state="normal" if page.offset > 0 else "disabled")
+        self.next_btn.configure(state="normal" if page.has_next else "disabled")
+
+    def _add_hit_card(self, hit):
+        card = ctk.CTkFrame(self.results_frame, fg_color="#1d1d1d", corner_radius=10)
+        card.pack(fill="x", pady=4, padx=4)
+
+        body = ctk.CTkFrame(card, fg_color="transparent")
+        body.pack(side="left", fill="both", expand=True, padx=14, pady=10)
+
+        title_row = ctk.CTkFrame(body, fg_color="transparent"); title_row.pack(anchor="w", fill="x")
+        ctk.CTkLabel(title_row, text=hit.title, font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
+        if hit.is_client_only():
+            ctk.CTkLabel(title_row, text=" 🚫 客户端专属", text_color="#e07a5f",
+                         font=ctk.CTkFont(size=11)).pack(side="left", padx=(8, 0))
+
+        desc = hit.description or ""
+        if len(desc) > 110: desc = desc[:107] + "…"
+        ctk.CTkLabel(body, text=desc, text_color="gray", wraplength=550,
+                     justify="left", anchor="w").pack(anchor="w", fill="x", pady=(2, 0))
+
+        ctk.CTkLabel(body, text=f"📥 {hit.downloads:,}   ·   {hit.slug}",
+                     text_color="#888", font=ctk.CTkFont(size=11)).pack(anchor="w", pady=(2, 0))
+
+        btn = ctk.CTkButton(card, text="📥 安装", width=90, height=34,
+                            fg_color="#2b719e", hover_color="#1f538d")
+        btn.configure(command=lambda h=hit, b=btn: self._on_install_clicked(h, b))
+        btn.pack(side="right", padx=14, pady=10)
+
+    def _on_install_clicked(self, hit, btn):
+        # Step 1: client-only check + confirmation
+        if hit.is_client_only():
+            dlg = ConfirmDialog(
+                self,
+                title="⚠️ 这是纯客户端模组",
+                msg=(f"\"{hit.title}\" 是 Modrinth 上标记为客户端专属的模组"
+                     f"（client_side={hit.client_side}, server_side={hit.server_side}）。"
+                     "装到服务端通常没用，部分还会让服务端崩溃。\n\n你确定要继续安装吗？"),
+                ok_text="仍然安装",
+                cancel_text="取消",
+                danger=True,
+            )
+            self.wait_window(dlg)
+            if not dlg.result:
+                return
+
+        # Step 2: background install
+        btn.configure(text="安装中…", state="disabled")
+        threading.Thread(target=self._run_install, args=(hit, btn), daemon=True).start()
+
+    def _run_install(self, hit, btn):
+        try:
+            versions = ms.get_project_versions(hit.project_id,
+                                                mc_version=self.mc_version,
+                                                loader=self.loader)
+            best = ms.pick_best_version(versions)
+            if not best:
+                raise RuntimeError("Modrinth 上没有匹配当前版本/loader 的发布")
+            file = ms.pick_primary_file(best)
+            if not file:
+                raise RuntimeError("该版本没有可下载的 .jar 文件")
+
+            dest_dir = find_mods_dir(self.server_path)
+            if not dest_dir:
+                # Server may be freshly created and have no mods/ yet — make one
+                default_sub = "plugins" if self.project_type == "plugin" else "mods"
+                dest_dir = os.path.join(self.server_path, default_sub)
+
+            target = ms.download_to(file["url"], dest_dir, file["filename"])
+            self.after(0, lambda: self._install_done(hit, btn, success=True,
+                                                     detail=f"已下载到 {os.path.relpath(target, self.server_path)}"))
+        except Exception as e:
+            self.after(0, lambda: self._install_done(hit, btn, success=False, detail=str(e)))
+
+    def _install_done(self, hit, btn, success, detail):
+        if success:
+            btn.configure(text="✅ 已安装", state="disabled",
+                          fg_color="#3d6b3d", hover_color="#3d6b3d")
+        else:
+            btn.configure(text="❌ 失败", state="normal",
+                          fg_color="#a13b3b", hover_color="#823030")
+        # Use the master's toplevel show_error helper for the detail
+        self.master._show_error(
+            "安装结果" if success else "安装失败",
+            f"{hit.title}\n\n{detail}",
+        )
+
+
+class ModpackImportWindow(ctk.CTkToplevel):
+    """三阶段：解析 manifest → 用户确认（含目标位置/名字）→ 后台导入 + 进度。"""
+
+    def __init__(self, master, archive_path):
+        super().__init__(master)
+        self.title("导入整合包")
+        self.geometry("720x540")
+        self.archive_path = archive_path
+        self.manifest = None
+        self._import_started = False
+
+        ctk.CTkLabel(self, text="📦 导入整合包", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(15, 4))
+        ctk.CTkLabel(self, text=os.path.basename(archive_path), text_color="gray",
+                     font=ctk.CTkFont(size=11)).pack()
+
+        self.body = ctk.CTkFrame(self, fg_color="transparent")
+        self.body.pack(fill="both", expand=True, padx=20, pady=10)
+
+        # Phase 1: parsing
+        ctk.CTkLabel(self.body, text="正在解析整合包…", text_color="gray").pack(pady=80)
+        threading.Thread(target=self._parse_in_bg, daemon=True).start()
+
+    # ---------- Phase 1: parse ----------
+
+    def _parse_in_bg(self):
+        try:
+            provider = mp.detect_provider(self.archive_path)
+            if not provider:
+                self.after(0, lambda: self._show_fatal(
+                    "无法识别此整合包格式。\n\n目前支持：Modrinth (.mrpack)。"
+                    "\n后续版本会陆续支持 CurseForge / MultiMC / MCBBS / HMCL 等。"))
+                return
+            manifest = provider.parse(self.archive_path)
+            # Many community modpacks omit env metadata. Look it up so the
+            # preview's "skip X client-only" number is accurate before the
+            # user confirms.
+            if hasattr(provider, "enrich_compat"):
+                self.after(0, lambda: self._update_parse_status("正在通过 Modrinth 反查兼容性…"))
+                provider.enrich_compat(manifest)
+        except Exception as e:
+            self.after(0, lambda: self._show_fatal(f"解析失败：{e}"))
+            return
+        self.manifest = manifest
+        self.after(0, self._show_preview)
+
+    def _update_parse_status(self, msg):
+        for w in self.body.winfo_children():
+            if isinstance(w, ctk.CTkLabel):
+                w.configure(text=msg)
+                return
+
+    def _show_fatal(self, msg):
+        for w in self.body.winfo_children(): w.destroy()
+        ctk.CTkLabel(self.body, text="❌", font=ctk.CTkFont(size=40)).pack(pady=(40, 8))
+        ctk.CTkLabel(self.body, text=msg, text_color="#e07a5f",
+                     wraplength=580, justify="left").pack(padx=20)
+        ctk.CTkButton(self.body, text="关闭", width=120, command=self.destroy).pack(pady=20)
+
+    # ---------- Phase 2: preview + confirm ----------
+
+    def _show_preview(self):
+        m = self.manifest
+        for w in self.body.winfo_children(): w.destroy()
+
+        info = ctk.CTkFrame(self.body, fg_color="#1d1d1d", corner_radius=10)
+        info.pack(fill="x", pady=(0, 10))
+        rows = [
+            ("整合包", f"{m.name}  ({m.format})"),
+            ("版本", m.version or "—"),
+            ("游戏版本", m.mc_version),
+            ("加载器", f"{m.loader}" + (f"  ({m.loader_version})" if m.loader_version else "")),
+            ("总文件数", f"{len(m.files)} 个 → 将安装 {len(m.server_files)}，跳过 {len(m.skipped_client_files)} 个客户端专属"),
+        ]
+        if m.summary:
+            rows.append(("简介", m.summary))
+        for label, value in rows:
+            row = ctk.CTkFrame(info, fg_color="transparent"); row.pack(fill="x", padx=14, pady=4)
+            ctk.CTkLabel(row, text=f"{label}:", width=80, anchor="w",
+                         text_color="gray", font=ctk.CTkFont(size=12, weight="bold")).pack(side="left")
+            ctk.CTkLabel(row, text=value, anchor="w", wraplength=520, justify="left").pack(side="left", fill="x", expand=True)
+
+        # Target name + parent dir
+        cfg = ctk.CTkFrame(self.body, fg_color="transparent"); cfg.pack(fill="x", pady=8)
+        ctk.CTkLabel(cfg, text="服务器名称:", anchor="w",
+                     font=ctk.CTkFont(weight="bold")).pack(anchor="w")
+        self.name_var = ctk.StringVar(value=_default_name_from(m.name) or "imported_server")
+        ctk.CTkEntry(cfg, textvariable=self.name_var, width=400).pack(anchor="w", pady=(2, 8))
+
+        ctk.CTkLabel(cfg, text="创建位置:", anchor="w",
+                     font=ctk.CTkFont(weight="bold")).pack(anchor="w")
+        dir_row = ctk.CTkFrame(cfg, fg_color="transparent"); dir_row.pack(anchor="w", fill="x", pady=2)
+        self.target_dir_var = ctk.StringVar(value=self.master.env.script_dir)
+        ctk.CTkEntry(dir_row, textvariable=self.target_dir_var, width=420).pack(side="left")
+        ctk.CTkButton(dir_row, text="浏览...", width=70,
+                      command=self._pick_dir).pack(side="left", padx=(6, 0))
+
+        # Action buttons
+        btn_row = ctk.CTkFrame(self.body, fg_color="transparent"); btn_row.pack(pady=20)
+        ctk.CTkButton(btn_row, text="取消", width=120, fg_color="#3d3d3d",
+                      hover_color="#4d4d4d", command=self.destroy).pack(side="left", padx=8)
+        ctk.CTkButton(btn_row, text="开始导入", width=160, fg_color="#2b719e",
+                      hover_color="#1f538d", command=self._begin_import).pack(side="left", padx=8)
+
+    def _pick_dir(self):
+        chosen = filedialog.askdirectory(initialdir=self.target_dir_var.get(),
+                                         title="选择创建位置")
+        if chosen:
+            self.target_dir_var.set(chosen)
+
+    # ---------- Phase 3: import in background ----------
+
+    def _begin_import(self):
+        if self._import_started: return
+        name = self.name_var.get().strip()
+        parent_dir = self.target_dir_var.get().strip()
+        if not name or not os.path.isdir(parent_dir):
+            self.master._show_error("无法导入", "请填写服务器名称并选择存在的目录。")
+            return
+        self._import_started = True
+        for w in self.body.winfo_children(): w.destroy()
+
+        ctk.CTkLabel(self.body, text=f"正在导入 {name}…",
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(pady=(20, 8))
+        self.stage_label = ctk.CTkLabel(self.body, text="准备中…", text_color="gray")
+        self.stage_label.pack()
+        self.progress_bar = ctk.CTkProgressBar(self.body, width=560)
+        self.progress_bar.set(0); self.progress_bar.pack(pady=(15, 6))
+        self.detail_label = ctk.CTkLabel(self.body, text="", text_color="gray",
+                                          font=ctk.CTkFont(size=11))
+        self.detail_label.pack()
+
+        threading.Thread(target=self._run_import,
+                         args=(name, parent_dir), daemon=True).start()
+
+    def _run_import(self, name, parent_dir):
+        try:
+            result = mp.import_modpack(
+                archive_path=self.archive_path,
+                server_name=name,
+                parent_dir=parent_dir,
+                env_manager=self.master.env,
+                installer=self.master.installer,
+                downloader=self.master.downloader,
+                progress_callback=lambda prog: self.after(0, lambda: self._on_progress(prog)),
+            )
+        except Exception as e:
+            self.after(0, lambda: self._show_fatal(f"导入异常：{e}"))
+            return
+        self.after(0, lambda: self._on_done(name, result))
+
+    def _on_progress(self, prog):
+        stage_text = {
+            "parsing": "解析中",
+            "creating_server": "创建服务端",
+            "downloading_files": "下载模组",
+            "applying_overrides": "应用 overrides",
+            "done": "完成",
+        }.get(prog.stage, prog.stage)
+        self.stage_label.configure(text=f"阶段：{stage_text}")
+        self.detail_label.configure(text=prog.message)
+        if prog.total > 0:
+            self.progress_bar.set(prog.current / prog.total)
+
+    def _on_done(self, name, result):
+        if result.success:
+            # Auto-register the imported server so version-mgmt page picks it up
+            try:
+                self.master.registry.add(RegistryEntry(
+                    name=name, path=result.server_path,
+                    loader=result.manifest.loader if result.manifest else "",
+                    mc_version=result.manifest.mc_version if result.manifest else "",
+                ))
+            except Exception as e:
+                print(f"[警告] 写入实例注册表失败：{e}")
+
+            for w in self.body.winfo_children(): w.destroy()
+            ctk.CTkLabel(self.body, text="🎉", font=ctk.CTkFont(size=44)).pack(pady=(30, 8))
+            ctk.CTkLabel(self.body, text="导入完成",
+                         font=ctk.CTkFont(size=18, weight="bold")).pack()
+            summary = (f"安装文件: {result.files_installed}   "
+                       f"跳过客户端: {result.files_skipped_client}   "
+                       f"失败: {result.files_failed}")
+            ctk.CTkLabel(self.body, text=summary, text_color="gray").pack(pady=8)
+            ctk.CTkLabel(self.body, text=result.server_path,
+                         text_color="#888", font=ctk.CTkFont(size=11)).pack()
+            row = ctk.CTkFrame(self.body, fg_color="transparent"); row.pack(pady=20)
+            ctk.CTkButton(row, text="去版本管理查看", width=160,
+                          fg_color="#2b719e", hover_color="#1f538d",
+                          command=lambda: (self.destroy(), self.master.show_versions())).pack(side="left", padx=8)
+            ctk.CTkButton(row, text="关闭", width=100, fg_color="#3d3d3d",
+                          hover_color="#4d4d4d", command=self.destroy).pack(side="left", padx=8)
+        else:
+            self._show_fatal(f"导入失败：{result.error or '未知错误'}\n\n"
+                             f"已下载 {result.files_installed}，失败 {result.files_failed}。")
+
+
+def _default_name_from(modpack_name: str) -> str:
+    """Sanitize a modpack title into a filesystem-safe folder name."""
+    bad = '<>:"/\\|?*'
+    out = "".join("_" if c in bad else c for c in modpack_name).strip()
+    return out[:60]
+
+
+# Standard tkinterdnd2-with-CustomTkinter integration: declare a mixin class so
+# ctk.CTk inherits TkinterDnD.DnDWrapper without losing CTk's own root logic.
+if _DND_AVAILABLE:
+    _APP_BASES = (ctk.CTk, TkinterDnD.DnDWrapper)
+else:
+    _APP_BASES = (ctk.CTk,)
+
+
+class HMSLApp(*_APP_BASES):
     def __init__(self):
         super().__init__()
+        if _DND_AVAILABLE:
+            self.TkdndVersion = TkinterDnD._require(self)
         self.title("HMSL - Hello Minecraft! Server Launcher")
         self.geometry("940x720")
         self.env = EnvManager()
@@ -263,19 +701,48 @@ class HMSLApp(ctk.CTk):
         self.main_frame.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
         self.show_home()
 
+        # --- 3. Global drag-and-drop: drop a .mrpack/.zip anywhere on the window ---
+        if _DND_AVAILABLE:
+            self.drop_target_register(DND_FILES)
+            self.dnd_bind("<<Drop>>", self._on_file_dropped)
+
     def clear_main_frame(self):
         for widget in self.main_frame.winfo_children(): widget.destroy()
 
     def show_home(self):
         self.clear_main_frame()
-        ctk.CTkLabel(self.main_frame, text="欢迎使用 HMSL", font=ctk.CTkFont(size=32, weight="bold")).pack(pady=(80, 10))
-        ctk.CTkLabel(self.main_frame, text="专业、极简、高效的一键式开服管理中心", text_color="gray", font=ctk.CTkFont(size=14)).pack(pady=(0, 50))
+        ctk.CTkLabel(self.main_frame, text="欢迎使用 HMSL", font=ctk.CTkFont(size=32, weight="bold")).pack(pady=(60, 10))
+        ctk.CTkLabel(self.main_frame, text="专业、极简、高效的一键式开服管理中心", text_color="gray", font=ctk.CTkFont(size=14)).pack(pady=(0, 30))
         self.start_btn = ctk.CTkButton(self.main_frame, text="🚀 开启服务器", width=300, height=90, corner_radius=45, font=ctk.CTkFont(size=26, weight="bold"))
         self.start_btn.pack(pady=20)
         info_card = ctk.CTkFrame(self.main_frame, width=420, height=120, corner_radius=15)
-        info_card.pack(pady=40, padx=40); info_card.pack_propagate(False)
+        info_card.pack(pady=30, padx=40); info_card.pack_propagate(False)
         ctk.CTkLabel(info_card, text="当前选中实例", font=ctk.CTkFont(size=13, weight="bold")).pack(pady=(20, 5))
         ctk.CTkLabel(info_card, text="尚未选择服务器", text_color="#3b8ed0", font=ctk.CTkFont(size=16)).pack()
+        if _DND_AVAILABLE:
+            ctk.CTkLabel(self.main_frame,
+                         text="💡 把 .mrpack / .zip 整合包拖到窗口里也能直接导入",
+                         text_color="#777", font=ctk.CTkFont(size=12)).pack(pady=(10, 0))
+
+    def _on_file_dropped(self, event):
+        """tkinterdnd2 emits a string like '{/path/with spaces/x.mrpack} /other/y.zip'.
+        We parse it with the tcl-aware splitter, take the first matching file."""
+        try:
+            paths = self.tk.splitlist(event.data)
+        except Exception:
+            paths = [event.data]
+        for p in paths:
+            p_clean = p.strip().strip("{}")  # belt-and-suspenders
+            lower = p_clean.lower()
+            if lower.endswith(".mrpack") or lower.endswith(".zip"):
+                if os.path.isfile(p_clean):
+                    ModpackImportWindow(self, archive_path=p_clean)
+                    return
+        # Nothing matched
+        self._show_error(
+            "无法识别拖入的文件",
+            "只支持拖入 .mrpack 或 .zip 整合包文件。",
+        )
 
     def show_versions(self):
         """实装版本管理页：合并 [脚本目录扫描] + [跨目录注册表] 展示服务器卡片。
@@ -383,6 +850,11 @@ class HMSLApp(ctk.CTk):
                                    command=self._action_open_folder)
         folder_btn.pack(side="left", padx=6)
 
+        browse_btn = ctk.CTkButton(btn_row, text="📥 下载模组", width=120, height=36, state="disabled",
+                                   fg_color="#3d4d6b", hover_color="#4d5d7b",
+                                   command=self._action_browse_mods)
+        browse_btn.pack(side="left", padx=6)
+
         scan_btn = ctk.CTkButton(btn_row, text="🧹 扫描模组", width=120, height=36, state="disabled",
                                  fg_color="#3d6b3d", hover_color="#4d7b4d",
                                  command=self._action_scan_mods)
@@ -398,7 +870,7 @@ class HMSLApp(ctk.CTk):
                                    command=self._action_remove_from_registry)
         remove_btn.pack(side="left", padx=6)
 
-        self._action_bar_buttons = [launch_btn, folder_btn, scan_btn, config_btn, remove_btn]
+        self._action_bar_buttons = [launch_btn, folder_btn, browse_btn, scan_btn, config_btn, remove_btn]
 
     def _action_launch(self):
         if not self.selected_instance: return
@@ -420,6 +892,15 @@ class HMSLApp(ctk.CTk):
     def _action_scan_mods(self):
         if not self.selected_instance: return
         ModScanWindow(self, self.selected_instance["name"], self.selected_instance["path"])
+
+    def _action_browse_mods(self):
+        if not self.selected_instance: return
+        # Pull mc_version + loader from registry where available; the scanner
+        # alone doesn't know these for legacy instances created before HMSL.
+        inst = self.selected_instance
+        mc_version = inst.get("version") if inst.get("version") not in (None, "", "未知版本") else None
+        loader = inst.get("type") if inst.get("type") not in (None, "", "未知类型", "已识别实例") else None
+        ModBrowserWindow(self, inst["name"], inst["path"], mc_version=mc_version, loader=loader)
 
     def _action_remove_from_registry(self):
         if not self.selected_instance: return
@@ -448,7 +929,12 @@ class HMSLApp(ctk.CTk):
     def show_download(self):
         self.clear_main_frame()
         self.selected_ver = None; self.selected_type.set("")
-        ctk.CTkLabel(self.main_frame, text="新建服务器向导", font=ctk.CTkFont(size=24, weight="bold")).pack(pady=(10, 20))
+        header = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        header.pack(fill="x", pady=(10, 10))
+        ctk.CTkLabel(header, text="新建服务器向导", font=ctk.CTkFont(size=24, weight="bold")).pack(side="left", padx=(0, 20))
+        ctk.CTkButton(header, text="📦 从整合包导入...", width=170, height=34,
+                      fg_color="#3d4d6b", hover_color="#4d5d7b",
+                      command=self._open_modpack_import).pack(side="left")
 
         # Footer is packed FIRST with side="bottom" so tk reserves space for the
         # action button before body_frame expands into the remaining area.
@@ -522,6 +1008,16 @@ class HMSLApp(ctk.CTk):
             self.finish_btn.configure(state="normal", fg_color="#2b719e")
         else:
             self.finish_btn.configure(state="disabled", fg_color=["#3B8ED0", "#1F6AA5"])
+
+    def _open_modpack_import(self):
+        """让用户选一个 .mrpack/.zip 整合包，并启动 ModpackImportWindow。"""
+        path = filedialog.askopenfilename(
+            title="选择整合包",
+            filetypes=[("整合包文件", "*.mrpack *.zip"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        ModpackImportWindow(self, archive_path=path)
 
     def pick_target_dir(self):
         chosen = filedialog.askdirectory(initialdir=self.target_dir_var.get() or self.env.script_dir,

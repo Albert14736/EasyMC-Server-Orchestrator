@@ -132,20 +132,41 @@
 
 ---
 
-### Phase 3 — Modrinth `.mrpack` 整合包导入
+### Phase 3 — 整合包导入（对标 HMCL 的 6 种 provider）
 
-**新增文件**：
-- `core/modpack_importer.py`：
-  - `parse_mrpack(zip_path) -> ModpackManifest`（含版本、loader、mod 列表）
-  - `import_modpack(manifest, target_dir, progress_callback) -> CreateServerResult`
-- `tests/test_modpack_importer.py`：用预制的小 mrpack 样本测试
+**目标**：参考 HMCL `ModpackHelper`，做可扩展的 provider 注册表，支持以下 6 种格式：
+
+| 格式 | 扩展 | manifest | provider 类 |
+|---|---|---|---|
+| Modrinth | `.mrpack` | `modrinth.index.json` | `ModrinthProvider` |
+| CurseForge | `.zip` | `manifest.json` | `CurseForgeProvider`（依赖 Phase 4 的 CF key） |
+| MultiMC | `.zip` | `mmc-pack.json` + `instance.cfg` | `MultiMCProvider` |
+| MCBBS | `.zip` | `mcbbs.packmeta` 等 | `MCBBSProvider` |
+| HMCL Native | `.zip` | `modpack.json` + `minecraft/pack.json` | `HMCLNativeProvider` |
+| Server Modpack | `.zip` | `server-manifest.json` | `HMCLServerProvider` |
+
+**架构**：
+- `core/modpack/__init__.py`：注册表 `PROVIDERS = [...]`、入口函数 `import_modpack(path, target_dir, callbacks)`，按顺序让 provider 自检
+- `core/modpack/base.py`：`ModpackProvider` ABC + `ModpackManifest` dataclass，统一 `detect()`、`parse()`、`apply()` 三步接口
+- `core/modpack/modrinth.py` 等：各 provider 独立模块
+
+**安装流程**（适用于所有 provider 的统一逻辑）：
+1. 用户选 zip/mrpack → 注册表按顺序问 `detect()` 直到匹配
+2. `parse()` 出 manifest：含 `mc_version` / `loader` / `loader_version` / `files`（每个 file 有 path、hash、download URL、env={client,server}）
+3. 复用 [core/server_factory.py](core/server_factory.py) `create_server()` 建好服务端基底
+4. 遍历 `files`：`env.server == "unsupported"` 跳过（这是关键，对应客户端模组警告的思路）；其余下载 + hash 校验 + 写入对应路径
+5. 解 `overrides/` 和 `server-overrides/`（如有）到 target；跳过 `client-overrides/`
+6. 调用 `progress_callback` 让 GUI 显示阶段 + 当前文件
+
+**起手实现**：先做 **Modrinth `.mrpack`**——最现代、有显式 server_side、无 API key、可立刻验证。其余 provider 在后续 session 一个个补。
 
 **GUI**：
-- "创建服务器"向导新增第二种入口："导入整合包"
-- 接受文件拖入（Tk 支持 `<<Drop>>` 事件，但 CustomTkinter 上需要小 wrapper）或点"浏览"选文件
-- 自动填充版本/loader、显示包含的模组数，确认后调 `import_modpack()`
+- "创建服务器"向导多一个入口："📦 导入整合包"，弹文件选择器（`filedialog.askopenfilename(filetypes=...)`）
+- 解析后预览：整合包名、版本、loader、共 X 个文件（其中 Y 个跳过：客户端专属）
+- 用户确认 → 进度窗口实时显示
+- 拖拽功能（`tkinterdnd2`）作为可选优化，**不阻挡 MVP**
 
-**预估工作量**：1.5 个 session（拖拽支持有 tk 限制要绕）
+**预估工作量**：Modrinth provider + 架构 = 1 session；其余 5 个 provider = 1 session/2-3 个
 
 ---
 
