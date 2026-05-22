@@ -19,12 +19,20 @@
 *   **Java 匹配**: macOS 使用 `java_home` 锁定版本；Windows 未来需适配注册表路径或 `where` 命令。
 *   **API 逻辑**: 使用 Modrinth V2 API，通过 `game_versions` 和 `loaders` 参数进行过滤。已升级至 v2.1，支持模糊匹配和多加载器回退。
 
-## 4. 遗留问题与待办
+## 4. 产品形态定位（已锁定）
+*   **对标**: HMCL（Hello Minecraft! Launcher）的服务端版，故名 HMSL。
+*   **技术路线**: Python + CustomTkinter + PyInstaller（macOS 出 `.app`、Windows 出 `.exe`），不走 Java/JavaFX 重写。
+*   **理由**: HMCL 早期选 Java 是因当时 Python GUI 不成熟；今天用 Python + PyInstaller 可等价复刻"双击即用"体验，且现有 `core/` 与 `gui_main.py` 可全部保留。
+*   详见 `WINDOWS_PLAN.md`。
+
+## 5. 遗留问题与待办
 *   **模组同步盲点**: TAB, FerriteCore, Connectivity 在 Modrinth API 中由于标签不规范导致同步率较低 (目前 12/15)。由于当前硬件环境（i7-13700HX/U9-285K）性能过剩，暂不急于死磕这三个模组，待后续优化。
-*   [ ] **Windows 兼容性优化**: 增加 `.bat` 启动脚本支持。
-*   [ ] **GUI 开发**: 基于 Python (PyQt6/Tkinter) 构建可视化操作界面。
+*   [ ] **GUI 按钮断点**: 首页"开启服务器"、版本管理"启动"按钮未绑 command。
+*   [ ] **Windows 兼容性**: `.bat` 启动脚本 + 注册表 Java 检测 + 抽离 POSIX-only 调用。
 *   [ ] **高级编辑器**: 可视化编辑 `server.properties`。
+*   [ ] **模组预设包 UI**: 纯净性能 / 社交增强 / 全家桶 / 自定义勾选。
+*   [ ] **打包发布**: PyInstaller 双平台构建 + 图标 + 首次运行向导。
 *   [ ] **模组库扩充**: 持续录入经过验证的常用模组 ID。
 
 ---
-*上次更新日期: 2026年5月20日*
+*上次更新日期: 2026年5月21日*

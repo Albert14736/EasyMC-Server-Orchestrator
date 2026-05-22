@@ -82,7 +82,8 @@ class ServerInstaller:
                 [java_cmd, "-jar", "forge-installer.jar", "--installServer"],
                 cwd=target_path,
                 capture_output=True,
-                text=True
+                text=True,
+                encoding="utf-8", errors="replace",
             )
             
             if result.returncode == 0:
@@ -161,7 +162,8 @@ class ServerInstaller:
                 [java_cmd, "-jar", "neoforge-installer.jar", "--installServer"],
                 cwd=target_path,
                 capture_output=True,
-                text=True
+                text=True,
+                encoding="utf-8", errors="replace",
             )
             
             if result.returncode == 0:
