@@ -16,17 +16,30 @@ from typing import Callable, List, Optional
 
 from .base import ImportProgress, ImportResult, ModpackManifest, ModpackProvider
 from .curseforge import CurseForgeProvider
+from .hmcl_native import HMCLNativeProvider
+from .hmcl_server import HMCLServerProvider
+from .mcbbs import MCBBSProvider
 from .modrinth import ModrinthProvider
+from .multimc import MultiMCProvider
 
 
-# Order matters: provider list is tried top-to-bottom. Put the most specific
-# detectors first (Modrinth's distinct .mrpack extension is the easiest tell).
-# CurseForge uses generic .zip but its detect() reads manifest.json's
-# "manifestType" field so false positives are negligible.
+# Order matters: provider list is tried top-to-bottom. Use most-specific
+# detectors first so e.g. MCBBS (which ALSO has manifestType=minecraftModpack
+# in its meta) isn't claimed by CurseForge first.
+#
+#   1. Modrinth      .mrpack extension OR modrinth.index.json
+#   2. MCBBS         mcbbs.packmeta present
+#   3. HMCL Server   server-manifest.json present
+#   4. HMCL Native   modpack.json + minecraft/pack.json both present
+#   5. MultiMC       mmc-pack.json present (may live under instance subdir)
+#   6. CurseForge    manifest.json with manifestType=minecraftModpack
 PROVIDERS: List[ModpackProvider] = [
     ModrinthProvider(),
+    MCBBSProvider(),
+    HMCLServerProvider(),
+    HMCLNativeProvider(),
+    MultiMCProvider(),
     CurseForgeProvider(),
-    # Future providers go here: MultiMCProvider(), MCBBSProvider(), ...
 ]
 
 
