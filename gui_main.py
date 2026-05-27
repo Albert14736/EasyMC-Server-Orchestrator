@@ -1,5 +1,6 @@
 import customtkinter as ctk
 import os
+import shutil
 import sys
 import threading
 import queue
@@ -55,7 +56,8 @@ class ConsoleWindow(ctk.CTkToplevel):
         self._closed = False
 
         ctk.CTkLabel(self, text=f"📟 {server_name}", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(10, 4))
-        ctk.CTkLabel(self, text=server_process.server_path, text_color="gray", font=ctk.CTkFont(size=11)).pack()
+        ctk.CTkLabel(self, text=_short_path(server_process.server_path, 70),
+                     text_color="gray", font=ctk.CTkFont(size=11)).pack()
 
         self.log_box = ctk.CTkTextbox(self, width=720, height=360, fg_color="#000000", text_color="#00ff66", font=("Menlo", 12))
         self.log_box.pack(padx=20, pady=10, fill="both", expand=True)
@@ -246,21 +248,78 @@ class ConfirmDialog(ctk.CTkToplevel):
     """简单模态确认弹窗：返回 True/False，给 GUI 决定是否继续敏感操作。"""
     def __init__(self, master, title, msg, ok_text="继续", cancel_text="取消", danger=False):
         super().__init__(master)
-        self.title(title); self.geometry("440x220")
+        self.title(title); self.geometry("520x320")
         self.result = False
-        ctk.CTkLabel(self, text=title, font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(20, 8))
-        ctk.CTkLabel(self, text=msg, wraplength=400, text_color="gray").pack(padx=20)
-        row = ctk.CTkFrame(self, fg_color="transparent"); row.pack(pady=20)
-        ctk.CTkButton(row, text=cancel_text, width=110, fg_color="#3d3d3d",
-                      hover_color="#4d4d4d", command=self._cancel).pack(side="left", padx=8)
-        ctk.CTkButton(row, text=ok_text, width=110,
+
+        # 底部按钮 FIRST + side="bottom" — 给它预留空间，
+        # 否则上面文本一长就会把按钮压成薄片（之前向导踩过同款坑）。
+        row = ctk.CTkFrame(self, fg_color="transparent")
+        row.pack(side="bottom", pady=20)
+        ctk.CTkButton(row, text=cancel_text, width=130, height=38,
+                      fg_color="#3d3d3d", hover_color="#4d4d4d",
+                      command=self._cancel).pack(side="left", padx=10)
+        ctk.CTkButton(row, text=ok_text, width=160, height=38,
                       fg_color=("#a13b3b" if danger else "#2b719e"),
                       hover_color=("#823030" if danger else "#1f538d"),
-                      command=self._ok).pack(side="left", padx=8)
+                      command=self._ok).pack(side="left", padx=10)
+
+        # 内容
+        ctk.CTkLabel(self, text=title,
+                     font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(24, 10))
+        ctk.CTkLabel(self, text=msg, wraplength=460, text_color="gray",
+                     justify="left").pack(padx=24, pady=(0, 10))
         self.transient(master); self.grab_set()
 
     def _ok(self):   self.result = True;  self.destroy()
     def _cancel(self): self.result = False; self.destroy()
+
+
+class RemoveOptionDialog(ctk.CTkToplevel):
+    """让用户选「仅从列表移除」还是「彻底卸载」。返回值在 self.choice。"""
+
+    def __init__(self, master, instance_name):
+        super().__init__(master)
+        self.title(f"移除 {instance_name}")
+        self.geometry("500x360")
+        self.choice = None  # "remove" / "uninstall" / None(取消)
+
+        ctk.CTkLabel(self, text=f"🗑 处理 {instance_name}",
+                     font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(18, 4))
+        ctk.CTkLabel(self, text="选择一种处理方式：",
+                     text_color="gray", font=ctk.CTkFont(size=12)).pack()
+
+        # Option 1: from-list-only (safe)
+        opt1 = ctk.CTkFrame(self, fg_color="#2a3540", corner_radius=10,
+                            border_width=1, border_color="#3a5570")
+        opt1.pack(fill="x", padx=20, pady=(14, 6))
+        ctk.CTkButton(opt1, text="📋 仅从列表移除", height=42,
+                      fg_color="#2b719e", hover_color="#1f538d",
+                      command=lambda: self._pick("remove")).pack(fill="x", padx=10, pady=(10, 4))
+        ctk.CTkLabel(opt1,
+                     text="只是不在 HMSL 显示。服务器文件夹和数据全部保留，下次还能找回。",
+                     text_color="#bbb", font=ctk.CTkFont(size=11),
+                     wraplength=440, justify="left").pack(padx=10, pady=(0, 10))
+
+        # Option 2: full uninstall (destructive)
+        opt2 = ctk.CTkFrame(self, fg_color="#3d2020", corner_radius=10,
+                            border_width=1, border_color="#883030")
+        opt2.pack(fill="x", padx=20, pady=6)
+        ctk.CTkButton(opt2, text="⚠️ 彻底卸载", height=42,
+                      fg_color="#a13b3b", hover_color="#823030",
+                      command=lambda: self._pick("uninstall")).pack(fill="x", padx=10, pady=(10, 4))
+        ctk.CTkLabel(opt2,
+                     text="永久删除整个服务器文件夹（世界、模组、配置、玩家存档全部丢失）。",
+                     text_color="#e0bbbb", font=ctk.CTkFont(size=11),
+                     wraplength=440, justify="left").pack(padx=10, pady=(0, 10))
+
+        ctk.CTkButton(self, text="取消", width=100, fg_color="#3d3d3d",
+                      hover_color="#4d4d4d", command=self.destroy).pack(pady=10)
+
+        self.transient(master); self.grab_set()
+
+    def _pick(self, choice):
+        self.choice = choice
+        self.destroy()
 
 
 class ModBrowserWindow(ctk.CTkToplevel):
@@ -638,7 +697,7 @@ class ModpackImportWindow(ctk.CTkToplevel):
                        f"跳过客户端: {result.files_skipped_client}   "
                        f"失败: {result.files_failed}")
             ctk.CTkLabel(self.body, text=summary, text_color="gray").pack(pady=6)
-            ctk.CTkLabel(self.body, text=result.server_path,
+            ctk.CTkLabel(self.body, text=_short_path(result.server_path, 60),
                          text_color="#888", font=ctk.CTkFont(size=11)).pack()
             # Transparent bypass notice — explain that we used the same trick
             # HMCL / PrismLauncher / etc use, so users understand and can
@@ -700,6 +759,466 @@ def _default_name_from(modpack_name: str) -> str:
     bad = '<>:"/\\|?*'
     out = "".join("_" if c in bad else c for c in modpack_name).strip()
     return out[:60]
+
+
+# ===== Config editors (embedded as Frames in the detail page's Tab) =====
+
+# server.properties known fields with Chinese labels + widget specs.
+# Anything not listed here goes to the bottom "raw" textbox so we never
+# lose values we don't have a visual for.
+#
+# Spec tuple shapes by type:
+#   ("bool", key, label, hint)
+#   ("int",  key, label, hint, min, max)
+#   ("str",  key, label, hint)
+#   ("choice", key, label, hint, [options])
+_SERVER_PROP_GROUPS = [
+    ("性能 / 网络", [
+        ("int",    "max-players", "最大玩家数", "上限玩家数量", 1, 200),
+        ("int",    "view-distance", "视距", "区块加载半径，越大越吃 CPU/内存", 3, 32),
+        ("int",    "simulation-distance", "模拟距离", "实体/方块模拟范围", 3, 32),
+        ("int",    "server-port", "端口", "默认 25565", 1, 65535),
+        ("int",    "network-compression-threshold", "网络压缩阈值", "≥此字节的包压缩；-1 关闭", -1, 1500),
+    ]),
+    ("玩法", [
+        ("choice", "difficulty", "难度", "", ["peaceful", "easy", "normal", "hard"]),
+        ("choice", "gamemode", "默认游戏模式", "", ["survival", "creative", "adventure", "spectator"]),
+        ("bool",   "hardcore", "极限模式", "死亡后变旁观者"),
+        ("bool",   "pvp", "PVP", "允许玩家互相攻击"),
+        ("bool",   "allow-flight", "允许飞行", "勾上才不会把飞行 mod 踢出"),
+        ("bool",   "allow-nether", "允许进入下界", ""),
+        ("int",    "spawn-protection", "出生点保护", "半径内方块只能 OP 改", 0, 32),
+    ]),
+    ("访问 / 安全", [
+        ("bool",   "online-mode", "正版验证", "关闭后离线玩家也能进，但安全风险大"),
+        ("bool",   "white-list", "启用白名单", ""),
+        ("bool",   "enforce-whitelist", "强制白名单", "踢出不在白名单上的在线玩家"),
+        ("bool",   "enable-command-block", "启用命令方块", ""),
+        ("int",    "op-permission-level", "OP 权限等级", "1-4，4 最高", 1, 4),
+    ]),
+    ("世界", [
+        ("str",    "level-name", "主世界文件夹名", "默认 world"),
+        ("str",    "level-seed", "世界种子", "留空 = 随机"),
+        ("bool",   "generate-structures", "生成结构", "村庄/神殿/要塞等"),
+        ("str",    "motd", "服务器说明", "玩家列表显示的副标题"),
+    ]),
+]
+
+
+def _short_path(path: str, max_chars: int = 55) -> str:
+    """
+    Left-truncate a path so the rightmost portion (with the filename) stays
+    visible, prepending '…' when truncated. Keeps the UI predictable when
+    paths are long, instead of letting labels overflow their containers.
+
+        _short_path("/Users/alice/Desktop/.../server.properties", 50)
+        # → '…op/projects/my-server/server.properties'
+    """
+    if not path:
+        return ""
+    if len(path) <= max_chars:
+        return path
+    return "…" + path[-(max_chars - 1):]
+
+
+def _enable_macos_trackpad_scroll(scrollable_frame: ctk.CTkScrollableFrame) -> None:
+    """
+    Workaround for a CustomTkinter ≤5.2.x quirk: child widgets inside a
+    CTkScrollableFrame consume macOS trackpad <MouseWheel> events instead of
+    letting them propagate to the inner canvas. Mouse-wheel works (different
+    event path) but two-finger scroll on a trackpad doesn't.
+
+    Walk all current descendants of the scrollable frame and forward their
+    MouseWheel events to the underlying canvas's yview_scroll.
+    """
+    if sys.platform != "darwin":
+        return
+    canvas = getattr(scrollable_frame, "_parent_canvas", None)
+    if canvas is None:
+        return
+
+    def on_wheel(event):
+        # macOS sends event.delta as small ints (e.g. -1/+1); negate to match
+        # natural scroll direction.
+        canvas.yview_scroll(int(-1 * event.delta), "units")
+        return "break"
+
+    def bind_recursive(w):
+        try:
+            w.bind("<MouseWheel>", on_wheel, add="+")
+        except Exception:
+            pass
+        for child in w.winfo_children():
+            bind_recursive(child)
+
+    bind_recursive(scrollable_frame)
+
+
+def _backup_then_write(path, content_str):
+    """Save with a .bak side-copy of the previous version (safety net)."""
+    if os.path.isfile(path):
+        try:
+            shutil.copyfile(path, path + ".bak")
+        except OSError:
+            pass  # backup is best-effort; don't block the save
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content_str)
+
+
+class ServerPropertiesEditor(ctk.CTkFrame):
+    """Visual editor for server.properties with grouped sections + raw fallback."""
+
+    def __init__(self, parent, server_path, app):
+        super().__init__(parent, fg_color="transparent")
+        self.server_path = server_path
+        self.app = app
+        self.properties_path = os.path.join(server_path, "server.properties")
+        self.vars = {}                # key -> StringVar / BooleanVar
+        self.original_lines = []      # preserve comments + ordering
+        self.raw_textbox = None       # for unknown keys
+        self._build_ui()
+        self._load()
+
+    def _build_ui(self):
+        # Top action bar: buttons FIRST on the right (predictable spot)
+        # then path label fills the remaining width with left-truncation.
+        top = ctk.CTkFrame(self, fg_color="transparent")
+        top.pack(fill="x", pady=(4, 8), padx=4)
+        ctk.CTkButton(top, text="💾 保存", width=110, height=34,
+                      fg_color="#2b719e", hover_color="#1f538d",
+                      command=self._save).pack(side="right")
+        ctk.CTkButton(top, text="↻ 重新加载", width=110, height=34,
+                      fg_color="#3d3d3d", hover_color="#4d4d4d",
+                      command=self._load).pack(side="right", padx=6)
+        ctk.CTkLabel(top, text=_short_path(self.properties_path, 60),
+                     text_color="gray", font=ctk.CTkFont(size=11),
+                     anchor="w").pack(side="left", padx=(4, 8), fill="x", expand=True)
+
+        # Scrollable form area
+        self.form = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        self.form.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # Build all known fields
+        for group_name, fields in _SERVER_PROP_GROUPS:
+            ctk.CTkLabel(self.form, text=group_name,
+                         font=ctk.CTkFont(size=14, weight="bold"),
+                         anchor="w").pack(anchor="w", pady=(12, 4), padx=4)
+            for spec in fields:
+                self._build_field(spec)
+
+        # Raw / unknown section header (filled in _load)
+        self.unknown_header = ctk.CTkLabel(
+            self.form, text="其他 (高级 / 未知字段)",
+            font=ctk.CTkFont(size=14, weight="bold"), anchor="w",
+        )
+        self.unknown_header.pack(anchor="w", pady=(20, 4), padx=4)
+        ctk.CTkLabel(self.form,
+                     text="按 key=value 一行一个；保存时会与上面的可视化字段合并写入。",
+                     text_color="gray", font=ctk.CTkFont(size=11),
+                     anchor="w").pack(anchor="w", padx=4)
+        self.raw_textbox = ctk.CTkTextbox(self.form, height=120,
+                                           fg_color="#000000",
+                                           text_color="#cccccc",
+                                           font=("Menlo", 11))
+        self.raw_textbox.pack(fill="x", padx=4, pady=(4, 12))
+
+        # macOS trackpad scroll: rebind after all children exist.
+        # after_idle ensures Tk has finished mapping the widgets first.
+        self.after_idle(lambda: _enable_macos_trackpad_scroll(self.form))
+
+    def _build_field(self, spec):
+        kind = spec[0]
+        row = ctk.CTkFrame(self.form, fg_color="transparent")
+        row.pack(fill="x", padx=4, pady=2)
+        if kind == "bool":
+            _k, key, label, hint = spec
+            var = ctk.BooleanVar(value=False)
+            cb = ctk.CTkCheckBox(row, text=label, variable=var, width=240)
+            cb.pack(side="left", padx=(4, 8))
+            if hint:
+                ctk.CTkLabel(row, text=hint, text_color="gray",
+                             font=ctk.CTkFont(size=11)).pack(side="left")
+            self.vars[key] = var
+        elif kind == "int":
+            _k, key, label, hint, lo, hi = spec
+            ctk.CTkLabel(row, text=label, width=160, anchor="w").pack(side="left", padx=(4, 4))
+            var = ctk.StringVar(value="")
+            ctk.CTkEntry(row, textvariable=var, width=80).pack(side="left", padx=(0, 8))
+            ctk.CTkLabel(row, text=f"({lo}–{hi}) {hint}",
+                         text_color="gray",
+                         font=ctk.CTkFont(size=11)).pack(side="left")
+            self.vars[key] = var
+        elif kind == "str":
+            _k, key, label, hint = spec
+            ctk.CTkLabel(row, text=label, width=160, anchor="w").pack(side="left", padx=(4, 4))
+            var = ctk.StringVar(value="")
+            ctk.CTkEntry(row, textvariable=var, width=260).pack(side="left", padx=(0, 8))
+            if hint:
+                ctk.CTkLabel(row, text=hint, text_color="gray",
+                             font=ctk.CTkFont(size=11)).pack(side="left")
+            self.vars[key] = var
+        elif kind == "choice":
+            _k, key, label, hint, options = spec
+            ctk.CTkLabel(row, text=label, width=160, anchor="w").pack(side="left", padx=(4, 4))
+            var = ctk.StringVar(value=options[0])
+            ctk.CTkOptionMenu(row, variable=var, values=options, width=140).pack(side="left", padx=(0, 8))
+            if hint:
+                ctk.CTkLabel(row, text=hint, text_color="gray",
+                             font=ctk.CTkFont(size=11)).pack(side="left")
+            self.vars[key] = var
+
+    def _load(self):
+        # Reset all vars to empty
+        for var in self.vars.values():
+            if isinstance(var, ctk.BooleanVar):
+                var.set(False)
+            else:
+                var.set("")
+
+        if not os.path.isfile(self.properties_path):
+            self.raw_textbox.delete("1.0", "end")
+            self.raw_textbox.insert("1.0",
+                "# server.properties 还不存在 —— 先启动一次服务器就会自动生成；\n"
+                "# 或在此输入 key=value 一行一个，按保存直接创建。\n")
+            return
+
+        try:
+            with open(self.properties_path, "r", encoding="utf-8", errors="replace") as f:
+                self.original_lines = f.readlines()
+        except OSError as e:
+            self.app._show_error("读取失败", str(e))
+            return
+
+        parsed = {}
+        for line in self.original_lines:
+            s = line.strip()
+            if not s or s.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            parsed[k.strip()] = v.rstrip("\r\n")
+
+        # Populate known vars
+        known_keys = set(self.vars.keys())
+        for key, var in self.vars.items():
+            if key not in parsed:
+                continue
+            raw = parsed[key]
+            if isinstance(var, ctk.BooleanVar):
+                var.set(raw.lower() == "true")
+            else:
+                var.set(raw)
+
+        # Anything not known → raw textbox
+        unknown_lines = []
+        for k, v in parsed.items():
+            if k not in known_keys:
+                unknown_lines.append(f"{k}={v}")
+        self.raw_textbox.delete("1.0", "end")
+        self.raw_textbox.insert("1.0", "\n".join(unknown_lines))
+
+    def _save(self):
+        # Gather final key→value map
+        final = {}
+        for key, var in self.vars.items():
+            val = var.get()
+            if isinstance(var, ctk.BooleanVar):
+                final[key] = "true" if val else "false"
+            else:
+                final[key] = str(val)
+        # Parse the raw textbox for extra keys
+        for line in self.raw_textbox.get("1.0", "end").splitlines():
+            s = line.strip()
+            if not s or s.startswith("#") or "=" not in s:
+                continue
+            k, _, v = s.partition("=")
+            k = k.strip()
+            if k:
+                final[k] = v.lstrip()
+
+        # Re-emit, preserving original line ordering + comments where possible
+        out = []
+        seen = set()
+        for line in self.original_lines:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                out.append(line); continue
+            if "=" not in line:
+                out.append(line); continue
+            k, _, _ = line.partition("=")
+            k = k.strip()
+            if k in final:
+                out.append(f"{k}={final[k]}\n")
+                seen.add(k)
+            else:
+                # key removed by user — just drop the line
+                pass
+        # Append any keys we have that weren't in the original
+        for k, v in final.items():
+            if k not in seen:
+                out.append(f"{k}={v}\n")
+
+        try:
+            _backup_then_write(self.properties_path, "".join(out))
+        except OSError as e:
+            self.app._show_error("保存失败", str(e))
+            return
+        self.app._show_error("已保存", "server.properties 已保存\n旧版备份为 server.properties.bak")
+
+
+class _FilePickerEditor(ctk.CTkFrame):
+    """Shared base for World/Mod config editors: left file list, right text editor."""
+
+    EXTS = (".toml", ".cfg", ".json", ".properties", ".yml", ".yaml", ".conf", ".txt")
+
+    def __init__(self, parent, server_path, app):
+        super().__init__(parent, fg_color="transparent")
+        self.server_path = server_path
+        self.app = app
+        self.current_file = None
+        self._build_ui()
+        self._refresh_file_list()
+
+    def _build_ui(self):
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=4, pady=4)
+
+        left = ctk.CTkFrame(body, fg_color="#2a2a2a", corner_radius=8)
+        left.pack(side="left", fill="y", padx=(0, 6))
+        self._build_top_controls(left)
+        self.file_list = ctk.CTkScrollableFrame(left, width=240, fg_color="transparent")
+        self.file_list.pack(fill="both", expand=True, padx=4, pady=4)
+
+        right = ctk.CTkFrame(body, fg_color="transparent")
+        right.pack(side="left", fill="both", expand=True)
+        self.file_label = ctk.CTkLabel(right, text="(在左侧选一个文件)",
+                                        text_color="gray",
+                                        font=ctk.CTkFont(size=11), anchor="w")
+        self.file_label.pack(anchor="w", padx=4, pady=(0, 4))
+        self.text = ctk.CTkTextbox(right, fg_color="#000000",
+                                    text_color="#dddddd",
+                                    font=("Menlo", 12))
+        self.text.pack(fill="both", expand=True, pady=(0, 6))
+
+        bot = ctk.CTkFrame(right, fg_color="transparent"); bot.pack(fill="x")
+        ctk.CTkButton(bot, text="💾 保存", width=110, height=34,
+                      fg_color="#2b719e", hover_color="#1f538d",
+                      command=self._save).pack(side="right")
+        ctk.CTkButton(bot, text="↻ 刷新", width=110, height=34,
+                      fg_color="#3d3d3d", hover_color="#4d4d4d",
+                      command=self._refresh_file_list).pack(side="right", padx=6)
+
+    def _build_top_controls(self, left_panel):
+        """Subclasses may add controls above the file list (e.g. world dropdown)."""
+        pass
+
+    # Subclasses override these:
+    def _list_files(self):
+        return []   # returns list of (display_label, full_path)
+
+    def _refresh_file_list(self):
+        for w in self.file_list.winfo_children(): w.destroy()
+        items = self._list_files()
+        if not items:
+            ctk.CTkLabel(self.file_list, text="(无可编辑文件)",
+                         text_color="gray").pack(pady=20)
+            return
+        for label, full in items:
+            ctk.CTkButton(self.file_list, text=label, anchor="w",
+                          fg_color="transparent", text_color="white",
+                          hover_color="#3a3a3a", height=28,
+                          command=lambda fp=full: self._open_file(fp)).pack(fill="x", pady=1, padx=2)
+
+    def _open_file(self, path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError as e:
+            self.app._show_error("打开失败", str(e)); return
+        self.current_file = path
+        self.file_label.configure(text=_short_path(os.path.relpath(path, self.server_path), 70))
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", content)
+
+    def _save(self):
+        if not self.current_file:
+            self.app._show_error("提示", "还没选文件，请在左侧点一个。"); return
+        content = self.text.get("1.0", "end-1c")  # strip the trailing newline Tk inserts
+        try:
+            _backup_then_write(self.current_file, content)
+        except OSError as e:
+            self.app._show_error("保存失败", str(e)); return
+        self.app._show_error("已保存",
+                              f"{os.path.basename(self.current_file)} 已保存（旧版备份为 .bak）")
+
+
+class WorldConfigEditor(_FilePickerEditor):
+    """Per-world config editor: world dropdown + files under serverconfig/."""
+
+    def __init__(self, parent, server_path, app):
+        self.worlds = []
+        self.world_var = None
+        super().__init__(parent, server_path, app)
+
+    def _build_top_controls(self, left_panel):
+        self.worlds = self._discover_worlds()
+        if not self.worlds:
+            ctk.CTkLabel(left_panel,
+                         text="(未发现已生成的世界)\n服务器需先启动一次\n才会生成 level.dat",
+                         text_color="gray", justify="center",
+                         font=ctk.CTkFont(size=11)).pack(pady=12, padx=8)
+            return
+        ctk.CTkLabel(left_panel, text="世界:", anchor="w",
+                     font=ctk.CTkFont(size=11)).pack(anchor="w", padx=8, pady=(8, 2))
+        self.world_var = ctk.StringVar(value=self.worlds[0])
+        ctk.CTkOptionMenu(left_panel, variable=self.world_var,
+                          values=self.worlds, width=220,
+                          command=lambda _v: self._refresh_file_list()).pack(padx=8, pady=(0, 8))
+
+    def _discover_worlds(self):
+        if not os.path.isdir(self.server_path):
+            return []
+        out = []
+        for name in sorted(os.listdir(self.server_path)):
+            d = os.path.join(self.server_path, name)
+            if os.path.isdir(d) and os.path.isfile(os.path.join(d, "level.dat")):
+                out.append(name)
+        return out
+
+    def _list_files(self):
+        if not self.world_var:
+            return []
+        world_dir = os.path.join(self.server_path, self.world_var.get())
+        out = []
+        # Forge per-world configs live under serverconfig/
+        sc = os.path.join(world_dir, "serverconfig")
+        if os.path.isdir(sc):
+            for f in sorted(os.listdir(sc)):
+                full = os.path.join(sc, f)
+                if os.path.isfile(full) and f.lower().endswith(self.EXTS):
+                    out.append((f"serverconfig/{f}", full))
+        # Editable text files at world root
+        for f in sorted(os.listdir(world_dir)):
+            full = os.path.join(world_dir, f)
+            if os.path.isfile(full) and f.lower().endswith(self.EXTS):
+                out.append((f, full))
+        return out
+
+
+class ModConfigEditor(_FilePickerEditor):
+    """Global mod config editor: walk <server>/config/ for editable files."""
+
+    def _list_files(self):
+        cfg_root = os.path.join(self.server_path, "config")
+        if not os.path.isdir(cfg_root):
+            return []
+        out = []
+        for dirpath, _dirs, files in os.walk(cfg_root):
+            for f in sorted(files):
+                if f.lower().endswith(self.EXTS):
+                    full = os.path.join(dirpath, f)
+                    rel = os.path.relpath(full, cfg_root)
+                    out.append((rel, full))
+        return out
 
 
 # Standard tkinterdnd2-with-CustomTkinter integration: declare a mixin class so
@@ -789,29 +1308,157 @@ class HMSLApp(*_APP_BASES):
         )
 
     def show_versions(self):
-        """实装版本管理页：合并 [脚本目录扫描] + [跨目录注册表] 展示服务器卡片。
-        采用 HMCL 式交互：卡片可点选，操作集中在底部 action bar。"""
+        """版本管理页 —— 列表视图。点击卡片跳转到该实例的详情页（HMCL 式）。"""
         self.clear_main_frame()
         self.selected_instance = None
-        self.instance_cards = []  # list of (card_frame, inst_dict) so we can update visuals
-        ctk.CTkLabel(self.main_frame, text="服务器实例管理", font=ctk.CTkFont(size=24, weight="bold")).pack(pady=(10, 5))
+        ctk.CTkLabel(self.main_frame, text="服务器实例管理",
+                     font=ctk.CTkFont(size=24, weight="bold")).pack(pady=(10, 5))
+        ctk.CTkLabel(self.main_frame, text="点击实例查看详情和管理操作",
+                     text_color="gray", font=ctk.CTkFont(size=12)).pack(pady=(0, 10))
 
         instances = self._collect_instances()
-
         if not instances:
-            ctk.CTkLabel(self.main_frame, text="未发现任何服务器实例，快去创建一个吧！", text_color="gray").pack(pady=100)
+            ctk.CTkLabel(self.main_frame,
+                         text="未发现任何服务器实例，快去创建一个吧！",
+                         text_color="gray").pack(pady=100)
             return
 
-        # IMPORTANT: pack action_bar BEFORE the scroll_frame so tk reserves space for it.
-        # Otherwise the scroll_frame's expand=True consumes everything and the bar is clipped
-        # (same root cause as the wizard footer bug we fixed earlier).
-        self._build_action_bar(self.main_frame)
-
-        scroll_frame = ctk.CTkScrollableFrame(self.main_frame, width=680, height=460, fg_color="transparent")
+        # IMPORTANT: width MUST be set or CTkScrollableFrame's internal canvas
+        # doesn't stretch and the cards collapse to ~200px (CTk known quirk).
+        # Height is left unset so the frame grows/shrinks with the window.
+        scroll_frame = ctk.CTkScrollableFrame(self.main_frame, width=680,
+                                               fg_color="transparent")
         scroll_frame.pack(fill="both", expand=True, padx=10, pady=10)
-
         for inst in instances:
             self.create_server_card(scroll_frame, inst)
+        # Macbook 触控板两指滑动需要显式 rebind
+        self.after_idle(lambda: _enable_macos_trackpad_scroll(scroll_frame))
+
+    # ===== Instance detail page (HMCL-style) =====
+
+    def show_instance_detail(self, inst, initial_tab="概览"):
+        """详情页：← 返回 + 实例信息头 + Tab 容器（概览 / 配置 / ...）。"""
+        self.clear_main_frame()
+        self.selected_instance = inst  # legacy action methods read this
+
+        # --- Header: back button + instance name + path ---
+        header = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        header.pack(fill="x", pady=(8, 4))
+        ctk.CTkButton(header, text="← 返回列表", width=110, height=32,
+                      fg_color="#3d3d3d", hover_color="#4d4d4d",
+                      command=self.show_versions).pack(side="left", padx=4)
+        title_box = ctk.CTkFrame(header, fg_color="transparent")
+        title_box.pack(side="left", fill="x", expand=True, padx=12)
+        ctk.CTkLabel(title_box, text=f"📦 {inst['name']}",
+                     font=ctk.CTkFont(size=20, weight="bold"),
+                     anchor="w").pack(anchor="w")
+        ctk.CTkLabel(title_box, text=_short_path(inst["path"], 70),
+                     font=ctk.CTkFont(size=11), text_color="gray",
+                     anchor="w").pack(anchor="w")
+
+        # --- Tabview ---
+        tabs = ctk.CTkTabview(self.main_frame, fg_color="#1d1d1d")
+        tabs.pack(fill="both", expand=True, padx=10, pady=10)
+        tabs.add("概览")
+        tabs.add("配置")
+        self._render_overview_tab(tabs.tab("概览"), inst)
+        self._render_config_tab(tabs.tab("配置"), inst)
+        try:
+            tabs.set(initial_tab)
+        except Exception:
+            pass
+
+    # --- Overview tab ---
+
+    def _render_overview_tab(self, parent, inst):
+        """实例概览：元数据卡片 + 6 个核心操作按钮（两行）。
+        整个内容包在 ScrollableFrame 里，窗口再小按钮也能滚到。"""
+        scroll = ctk.CTkScrollableFrame(parent, fg_color="transparent")
+        scroll.pack(fill="both", expand=True)
+        scroll.after_idle(lambda: _enable_macos_trackpad_scroll(scroll))
+        parent = scroll  # everything below packs into the scrollable area
+
+        # Metadata card
+        meta = ctk.CTkFrame(parent, fg_color="#2a2a2a", corner_radius=10)
+        meta.pack(fill="x", padx=8, pady=8)
+        rows = [
+            ("加载器", inst.get("type", "未知")),
+            ("游戏版本", inst.get("version", "未知")),
+            ("EULA", "✅ 已同意" if inst.get("eula") else "⚠️ 待同意"),
+            ("路径", _short_path(inst["path"], 65)),
+        ]
+        for label, value in rows:
+            row = ctk.CTkFrame(meta, fg_color="transparent")
+            row.pack(fill="x", padx=14, pady=3)
+            ctk.CTkLabel(row, text=f"{label}:", width=80, anchor="w",
+                         text_color="gray",
+                         font=ctk.CTkFont(size=12, weight="bold")).pack(side="left")
+            ctk.CTkLabel(row, text=value, anchor="w").pack(side="left", fill="x", expand=True)
+
+        # Actions — 2 rows of 3 (same grouping as before)
+        ctk.CTkLabel(parent, text="操作", font=ctk.CTkFont(size=14, weight="bold"),
+                     anchor="w").pack(anchor="w", padx=10, pady=(16, 4))
+
+        row1 = ctk.CTkFrame(parent, fg_color="transparent"); row1.pack(pady=(4, 4))
+        row2 = ctk.CTkFrame(parent, fg_color="transparent"); row2.pack(pady=(4, 8))
+
+        ctk.CTkButton(row1, text="▶ 启动", width=140, height=42,
+                      fg_color="#2b719e", hover_color="#1f538d",
+                      font=ctk.CTkFont(size=14, weight="bold"),
+                      command=self._action_launch).pack(side="left", padx=6)
+        ctk.CTkButton(row1, text="📂 文件夹", width=140, height=42,
+                      fg_color="#3d3d3d", hover_color="#4d4d4d",
+                      command=self._action_open_folder).pack(side="left", padx=6)
+        ctk.CTkButton(row1, text="📥 下载模组", width=140, height=42,
+                      fg_color="#3d4d6b", hover_color="#4d5d7b",
+                      command=self._action_browse_mods).pack(side="left", padx=6)
+
+        ctk.CTkButton(row2, text="🧹 扫描模组", width=140, height=42,
+                      fg_color="#3d6b3d", hover_color="#4d7b4d",
+                      command=self._action_scan_mods).pack(side="left", padx=6)
+        ctk.CTkButton(row2, text="📂 打开 config", width=140, height=42,
+                      fg_color="#3d3d3d", hover_color="#4d4d4d",
+                      command=lambda: self._open_subfolder(inst["path"], "config")).pack(side="left", padx=6)
+        ctk.CTkButton(row2, text="🗑 移除...", width=140, height=42,
+                      fg_color="#5a2b2b", hover_color="#7a3535",
+                      command=self._action_remove_or_uninstall).pack(side="left", padx=6)
+
+    def _open_subfolder(self, server_path, sub):
+        """Open a subdirectory of the server in the OS file manager.
+        Creates the folder if missing so the link never dead-ends."""
+        target = os.path.join(server_path, sub)
+        os.makedirs(target, exist_ok=True)
+        if sys.platform == "darwin":   os.system(f"open '{target}'")
+        elif sys.platform == "win32":  os.system(f'explorer "{target}"')
+        else:                          os.system(f"xdg-open '{target}'")
+
+    # --- Config tab (with 3 sub-tabs) ---
+
+    def _render_config_tab(self, parent, inst):
+        """配置中心：3 个 sub-tab —— server.properties / 世界 / 模组。"""
+        sub = ctk.CTkTabview(parent, fg_color="#2a2a2a")
+        sub.pack(fill="both", expand=True, padx=4, pady=4)
+        sub.add("🌐 server.properties")
+        sub.add("🌍 世界")
+        sub.add("🔧 模组")
+        self._render_server_properties_subtab(sub.tab("🌐 server.properties"), inst)
+        self._render_world_config_subtab(sub.tab("🌍 世界"), inst)
+        self._render_mod_config_subtab(sub.tab("🔧 模组"), inst)
+
+    def _render_server_properties_subtab(self, parent, inst):
+        """server.properties 可视化编辑 + 未知 key 走 raw 文本框。"""
+        editor = ServerPropertiesEditor(parent, inst["path"], self)
+        editor.pack(fill="both", expand=True)
+
+    def _render_world_config_subtab(self, parent, inst):
+        """世界配置：先列实例下所有世界（含 level.dat 的子目录），选一个后列其下文件。"""
+        editor = WorldConfigEditor(parent, inst["path"], self)
+        editor.pack(fill="both", expand=True)
+
+    def _render_mod_config_subtab(self, parent, inst):
+        """config/ 全局模组配置：文件树 + 原始文本编辑。"""
+        editor = ModConfigEditor(parent, inst["path"], self)
+        editor.pack(fill="both", expand=True)
 
     def _collect_instances(self):
         """合并扫描结果和注册表，按绝对路径去重；扫描结果优先（包含 eula 等额外字段）。"""
@@ -833,8 +1480,9 @@ class HMSLApp(*_APP_BASES):
         return list(seen.values())
 
     def create_server_card(self, parent, inst):
-        """卡片本身可点选；操作按钮统一放在底部 action bar，不再挤在卡片内。"""
-        card = ctk.CTkFrame(parent, height=90, corner_radius=15, border_width=2, border_color="#2b2b2b")
+        """卡片整块可点击。点击 → 跳转到该实例的详情页（HMCL 风格）。"""
+        card = ctk.CTkFrame(parent, height=90, corner_radius=15,
+                            border_width=2, border_color="#2b2b2b")
         card.pack(fill="x", pady=8, padx=10); card.pack_propagate(False)
 
         icon = ctk.CTkLabel(card, text="📦", font=ctk.CTkFont(size=30))
@@ -842,79 +1490,30 @@ class HMSLApp(*_APP_BASES):
         info_box = ctk.CTkFrame(card, fg_color="transparent")
         info_box.pack(side="left", fill="both", expand=True, pady=12)
 
-        name_label = ctk.CTkLabel(info_box, text=inst["name"], font=ctk.CTkFont(size=16, weight="bold"), anchor="w")
+        name_label = ctk.CTkLabel(info_box, text=inst["name"],
+                                   font=ctk.CTkFont(size=16, weight="bold"), anchor="w")
         name_label.pack(anchor="w", fill="x")
         status_text = "✅ EULA 已同意" if inst["eula"] else "⚠️ 待同意 EULA"
-        meta_text = f"{inst['path']}  |  {status_text}"
-        meta_label = ctk.CTkLabel(info_box, text=meta_text, font=ctk.CTkFont(size=11), text_color="gray", anchor="w", wraplength=520, justify="left")
+        meta_label = ctk.CTkLabel(info_box,
+                                   text=f"{_short_path(inst['path'], 60)}  |  {status_text}",
+                                   font=ctk.CTkFont(size=11), text_color="gray",
+                                   anchor="w")
         meta_label.pack(anchor="w", fill="x")
 
-        # Bind click on every child too — Tk doesn't bubble events to parent automatically.
+        # Right-side chevron hints "click to enter"
+        ctk.CTkLabel(card, text="›", font=ctk.CTkFont(size=28),
+                     text_color="#666").pack(side="right", padx=20)
+
+        # Whole card + children → click to enter detail
         clickable = [card, icon, info_box, name_label, meta_label]
         for w in clickable:
-            w.bind("<Button-1>", lambda e, i=inst: self._select_instance(i))
-
-        self.instance_cards.append((card, inst))
-
-    def _select_instance(self, inst):
-        """高亮选中的卡片，启用 action bar 按钮。"""
-        self.selected_instance = inst
-        sel_path = os.path.abspath(inst["path"])
-        for card, c_inst in self.instance_cards:
-            if os.path.abspath(c_inst["path"]) == sel_path:
-                card.configure(border_color="#2b719e")  # 主题蓝
-            else:
-                card.configure(border_color="#2b2b2b")
-        # Refresh action bar state
-        if hasattr(self, "_action_bar_buttons"):
-            for btn in self._action_bar_buttons:
-                btn.configure(state="normal")
-        if hasattr(self, "_selected_label"):
-            self._selected_label.configure(text=f"已选中：{inst['name']}")
-
-    def _build_action_bar(self, parent):
-        """页面底部的统一操作栏。无选中时按钮 disabled。"""
-        bar = ctk.CTkFrame(parent, height=88, corner_radius=15, fg_color="#1d1d1d")
-        bar.pack(fill="x", side="bottom", padx=10, pady=(0, 10))
-        bar.pack_propagate(False)
-
-        self._selected_label = ctk.CTkLabel(bar, text="请从上方点选一个实例", text_color="gray", font=ctk.CTkFont(size=12))
-        self._selected_label.pack(pady=(8, 0))
-
-        btn_row = ctk.CTkFrame(bar, fg_color="transparent")
-        btn_row.pack(pady=(4, 8))
-
-        launch_btn = ctk.CTkButton(btn_row, text="▶ 启动", width=110, height=36, state="disabled",
-                                   fg_color="#2b719e", hover_color="#1f538d",
-                                   command=self._action_launch)
-        launch_btn.pack(side="left", padx=6)
-
-        folder_btn = ctk.CTkButton(btn_row, text="📂 文件夹", width=110, height=36, state="disabled",
-                                   fg_color="#3d3d3d", hover_color="#4d4d4d",
-                                   command=self._action_open_folder)
-        folder_btn.pack(side="left", padx=6)
-
-        browse_btn = ctk.CTkButton(btn_row, text="📥 下载模组", width=120, height=36, state="disabled",
-                                   fg_color="#3d4d6b", hover_color="#4d5d7b",
-                                   command=self._action_browse_mods)
-        browse_btn.pack(side="left", padx=6)
-
-        scan_btn = ctk.CTkButton(btn_row, text="🧹 扫描模组", width=120, height=36, state="disabled",
-                                 fg_color="#3d6b3d", hover_color="#4d7b4d",
-                                 command=self._action_scan_mods)
-        scan_btn.pack(side="left", padx=6)
-
-        config_btn = ctk.CTkButton(btn_row, text="⚙ 编辑配置", width=110, height=36, state="disabled",
-                                   fg_color="#3d3d3d", hover_color="#4d4d4d",
-                                   command=self._action_edit_config)
-        config_btn.pack(side="left", padx=6)
-
-        remove_btn = ctk.CTkButton(btn_row, text="🗑 从列表移除", width=130, height=36, state="disabled",
-                                   fg_color="#5a2b2b", hover_color="#7a3535",
-                                   command=self._action_remove_from_registry)
-        remove_btn.pack(side="left", padx=6)
-
-        self._action_bar_buttons = [launch_btn, folder_btn, browse_btn, scan_btn, config_btn, remove_btn]
+            w.bind("<Button-1>", lambda e, i=inst: self.show_instance_detail(i))
+        # Hover affordance — change border color on enter/leave
+        def _on_enter(e, c=card): c.configure(border_color="#3a5570")
+        def _on_leave(e, c=card): c.configure(border_color="#2b2b2b")
+        for w in clickable:
+            w.bind("<Enter>", _on_enter)
+            w.bind("<Leave>", _on_leave)
 
     def _action_launch(self):
         if not self.selected_instance: return
@@ -930,9 +1529,6 @@ class HMSLApp(*_APP_BASES):
         else:
             os.system(f"xdg-open '{path}'")
 
-    def _action_edit_config(self):
-        self._show_error("功能开发中", "可视化编辑 server.properties 的功能还未实装，下个版本见。")
-
     def _action_scan_mods(self):
         if not self.selected_instance: return
         ModScanWindow(self, self.selected_instance["name"], self.selected_instance["path"])
@@ -946,14 +1542,79 @@ class HMSLApp(*_APP_BASES):
         loader = inst.get("type") if inst.get("type") not in (None, "", "未知类型", "已识别实例") else None
         ModBrowserWindow(self, inst["name"], inst["path"], mc_version=mc_version, loader=loader)
 
-    def _action_remove_from_registry(self):
+    def _action_remove_or_uninstall(self):
+        """两步流程：先弹选项框，再按选项分发。"""
         if not self.selected_instance: return
-        path = self.selected_instance["path"]
-        removed = self.registry.remove(path)
-        msg = "已从列表中移除（服务器文件并未删除）。" if removed else "该实例不在注册表中（可能是脚本目录下被扫描出的服务器），暂无法从列表移除。"
+        inst = self.selected_instance
+        dlg = RemoveOptionDialog(self, inst["name"])
+        self.wait_window(dlg)
+        if dlg.choice == "remove":
+            self._do_remove_from_registry(inst)
+        elif dlg.choice == "uninstall":
+            self._do_uninstall_with_confirm(inst)
+
+    def _do_remove_from_registry(self, inst):
+        """选项 1：仅从注册表移除，不动文件。"""
+        removed = self.registry.remove(inst["path"])
+        msg = ("已从列表中移除。\n\n服务器文件夹和数据全部保留在原位，"
+               "下次扫描或重新注册时还能找回。") if removed else \
+              ("该实例不在注册表中（可能是脚本目录扫描出的旧实例），"
+               "无法仅「从列表移除」。如要彻底删除，请选「卸载」。")
         self._show_error("移除结果", msg)
         if removed:
-            self.show_versions()  # refresh
+            self.show_versions()
+
+    def _do_uninstall_with_confirm(self, inst):
+        """选项 2：弹红色二次确认，确认后 rmtree。"""
+        confirm = ConfirmDialog(
+            self,
+            title="⚠️ 确认彻底卸载",
+            msg=(f"即将永久删除整个服务器文件夹：\n\n"
+                 f"{inst['path']}\n\n"
+                 f"包括世界数据、模组、配置、玩家存档等全部内容。\n"
+                 f"此操作不可撤销！"),
+            ok_text="确认彻底删除",
+            cancel_text="取消",
+            danger=True,
+        )
+        self.wait_window(confirm)
+        if not confirm.result:
+            return
+        ok, err = self._delete_server_folder_safely(inst["path"])
+        if not ok:
+            self._show_error("卸载失败", err)
+            return
+        # Also clean up the registry entry if present
+        try:
+            self.registry.remove(inst["path"])
+        except Exception:
+            pass
+        self._show_error("卸载完成", f"已永久删除 {inst['name']}。")
+        self.show_versions()
+
+    @staticmethod
+    def _delete_server_folder_safely(path):
+        """rmtree 但加几道护栏，拒绝删可能误伤的系统/家目录。"""
+        import shutil
+        if not path:
+            return False, "路径为空"
+        abs_path = os.path.abspath(path)
+        if not os.path.isdir(abs_path):
+            return False, f"目录不存在：{abs_path}"
+        # Refuse top-level or sensitive paths
+        forbidden = {
+            "/", os.path.expanduser("~"),
+            "/Users", "/Applications", "/System", "/Library",
+            "/etc", "/var", "/tmp", "/usr", "/bin",
+            "C:\\", "C:/",
+        }
+        if abs_path in forbidden or len(abs_path) <= 3:
+            return False, f"路径过于敏感，拒绝执行：{abs_path}"
+        try:
+            shutil.rmtree(abs_path)
+            return True, None
+        except OSError as e:
+            return False, str(e)
 
     def open_console(self, name, server_path):
         """打开一个独立控制台窗口，启动服务器并实时显示日志。"""
@@ -1123,6 +1784,74 @@ class HMSLApp(*_APP_BASES):
     def _update_ui_state(self, val, text):
         self.progress_bar.set(val); self.progress_label.configure(text=text)
 
+def _route_to(app: "HMSLApp", route: str) -> None:
+    """Drive the GUI to a specific screen via short routes — used by
+    tools/snap.py so I can iterate without manual click-through.
+
+    Supported routes (':' delimited):
+        home, versions, download
+        detail:<instance_name>
+        config:<instance_name>          (detail page + 配置 tab active)
+    """
+    if not route:
+        return
+    parts = route.split(":", 1)
+    page = parts[0]
+    if page == "home":      app.show_home(); return
+    if page == "versions":  app.show_versions(); return
+    if page == "download":  app.show_download(); return
+    if page in ("detail", "config") and len(parts) == 2:
+        name = parts[1]
+        for inst in app._collect_instances():
+            if inst["name"] == name:
+                initial_tab = "配置" if page == "config" else "概览"
+                app.show_instance_detail(inst, initial_tab=initial_tab)
+                return
+        print(f"[route_to] 找不到名为 {name!r} 的实例")
+
+
+def _snap_and_quit(app, out_path: str) -> None:
+    """Bring HMSL window to front, screencapture just its bounds, quit.
+    Used by tools/snap.py so Claude can iterate on UI without bothering the user."""
+    import subprocess as _sp
+    try:
+        app.attributes("-topmost", True)
+        app.lift()
+        app.focus_force()
+        app.update()
+        # Tk reports content rect; on macOS the OS adds a ~28px title bar above.
+        # winfo_rootx/y already accounts for title bar position in Aqua so this works.
+        x, y = app.winfo_rootx(), app.winfo_rooty()
+        w, h = app.winfo_width(), app.winfo_height()
+        # Pad up a bit to include the macOS title bar in the shot
+        y_pad = 28
+        _sp.run(["screencapture", "-x", "-R",
+                 f"{x},{max(0, y - y_pad)},{w},{h + y_pad}", out_path],
+                check=False)
+    except Exception as e:
+        print(f"[snap_and_quit] error: {e}")
+    finally:
+        app.after(50, app.quit)
+
+
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="HMSL — Hello Minecraft! Server Launcher")
+    parser.add_argument("--route", default="",
+                        help="Auto-navigate after launch (e.g. 'versions', "
+                             "'detail:我的世界服务器', 'config:我的世界服务器').")
+    parser.add_argument("--snap", default="",
+                        help="After --route, screencap the window to this PATH and exit. "
+                             "Used by tools/snap.py for headless UI iteration.")
+    parser.add_argument("--settle", type=float, default=1.5,
+                        help="Seconds to wait after route before snapping (default 1.5).")
+    args = parser.parse_args()
+
     app = HMSLApp()
+    if args.route:
+        app.after(300, lambda: _route_to(app, args.route))
+    if args.snap:
+        # Run snap AFTER route + settle so the destination page is fully painted
+        app.after(int((args.settle + 0.3) * 1000),
+                  lambda: _snap_and_quit(app, args.snap))
     app.mainloop()
