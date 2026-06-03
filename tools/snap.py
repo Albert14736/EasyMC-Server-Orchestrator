@@ -14,9 +14,20 @@ Examples:
 How it works (no AppleScript / no Accessibility permission needed):
   1. Kills any existing gui_main.py
   2. Launches `python gui_main.py --route ROUTE --snap OUT --settle SETTLE`
-     The GUI itself knows its own window position (winfo_rootx/y/width/height),
-     lifts itself to front, calls `screencapture -R x,y,w,h OUT`, then quits.
+     The GUI activates itself to the foreground (AppKit), then captures itself
+     **by CGWindowID** (`screencapture -l <id>`, via pyobjc/Quartz) so the shot
+     is the HMSL window itself — never whatever window happens to overlap it.
   3. Returns when the process exits, prints the OUT path
+
+依赖（仅截图用，普通运行/打包不需要；见 requirements.txt 的 dev 段）：
+    pip install --only-binary=:all: 'pyobjc-framework-Quartz==9.2' \
+                                    'pyobjc-framework-Cocoa==9.2'
+  （py3.8 锁 9.2：新版 pyobjc 已弃 3.8。拿不到 Quartz 时自动回退区域截图。）
+
+⚠️ 已知限制：从后台启动的进程抢不到真正的 key 窗口状态，macOS 会推迟**非顶层
+   Canvas**（CTkScrollableFrame 内部）的文字绘制 —— server.properties / 模组配置
+   这类滚动表单里的字段文字在截图里可能是空白。顶层内容（侧栏/头部/概览/按钮/
+   tab）都正常。要核实滚动表单内容请用控件树 introspection 而非截图。
 
 Only macOS (uses /usr/sbin/screencapture via the launched Python).
 """

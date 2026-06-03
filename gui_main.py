@@ -25,7 +25,7 @@ except ImportError:
     _DND_AVAILABLE = False
     DND_FILES = None
     TkinterDnD = None
-from instance_scanner_test import InstanceScanner # 导入扫描器
+from core.instance_scanner import InstanceScanner
 
 # 设置外观主题
 ctk.set_appearance_mode("dark")
@@ -882,7 +882,7 @@ class ServerPropertiesEditor(ctk.CTkFrame):
     def _build_ui(self):
         # Top action bar: buttons FIRST on the right (predictable spot)
         # then path label fills the remaining width with left-truncation.
-        top = ctk.CTkFrame(self, fg_color="transparent")
+        top = self._top_bar = ctk.CTkFrame(self, fg_color="transparent")
         top.pack(fill="x", pady=(4, 8), padx=4)
         ctk.CTkButton(top, text="💾 保存", width=110, height=34,
                       fg_color="#2b719e", hover_color="#1f538d",
@@ -893,6 +893,14 @@ class ServerPropertiesEditor(ctk.CTkFrame):
         ctk.CTkLabel(top, text=_short_path(self.properties_path, 60),
                      text_color="gray", font=ctk.CTkFont(size=11),
                      anchor="w").pack(side="left", padx=(4, 8), fill="x", expand=True)
+
+        # 文件缺失横幅：固定在动作栏与表单之间，仅当 server.properties 不存在时
+        # 显示（由 _load 控制 pack/pack_forget）。否则用户看到一排空字段会以为坏了。
+        self.banner = ctk.CTkLabel(
+            self, text="", fg_color="#5a4a2b", corner_radius=8,
+            anchor="w", justify="left", wraplength=620,
+            font=ctk.CTkFont(size=12),
+        )
 
         # Scrollable form area
         self.form = ctk.CTkScrollableFrame(self, fg_color="transparent")
@@ -976,11 +984,18 @@ class ServerPropertiesEditor(ctk.CTkFrame):
                 var.set("")
 
         if not os.path.isfile(self.properties_path):
+            self.banner.configure(
+                text="⚠️ 这台服务器还没有 server.properties —— 先到「概览」页点 "
+                     "▶ 启动 让它生成一次，或直接在下面填好字段点 💾 保存来创建。")
+            self.banner.pack(fill="x", padx=4, pady=(0, 8), after=self._top_bar)
             self.raw_textbox.delete("1.0", "end")
             self.raw_textbox.insert("1.0",
                 "# server.properties 还不存在 —— 先启动一次服务器就会自动生成；\n"
                 "# 或在此输入 key=value 一行一个，按保存直接创建。\n")
             return
+
+        # 文件存在 —— 确保横幅隐藏（重新加载时可能从"缺失"切到"存在"）
+        self.banner.pack_forget()
 
         try:
             with open(self.properties_path, "r", encoding="utf-8", errors="replace") as f:
@@ -1262,6 +1277,10 @@ class HMSLApp(*_APP_BASES):
         # --- 2. 右侧主内容区 ---
         self.main_frame = ctk.CTkFrame(self, corner_radius=15, fg_color="transparent")
         self.main_frame.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
+        # 让主内容区填满窗口：row0 + 右列(col1) 吃满剩余空间。否则 main_frame 只会
+        # 缩到内容自然尺寸，详情页 Tabview 撑不开、6 个操作按钮被挤到可视区外。
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(1, weight=1)
         self.show_home()
 
         # --- 3. Global drag-and-drop: drop a .mrpack/.zip anywhere on the window ---
@@ -1361,12 +1380,17 @@ class HMSLApp(*_APP_BASES):
         tabs.pack(fill="both", expand=True, padx=10, pady=10)
         tabs.add("概览")
         tabs.add("配置")
-        self._render_overview_tab(tabs.tab("概览"), inst)
-        self._render_config_tab(tabs.tab("配置"), inst)
+        # 先把目标 tab 设为激活（此时 frame 还空，切换最干净），再渲染内容 —— 把重
+        # 内容塞进未激活 tab 之后再 set() 会触发 CTkTabview“按钮切了内容没切”的时序
+        # bug（main_frame 撑满高度后更易复现）。
         try:
             tabs.set(initial_tab)
         except Exception:
             pass
+        self._render_overview_tab(tabs.tab("概览"), inst)
+        self._render_config_tab(tabs.tab("配置"), inst)
+        # 渲染后再确认一次，防止渲染过程内部又改动了可见 frame。
+        tabs.after_idle(lambda: tabs.set(initial_tab))
 
     # --- Overview tab ---
 
@@ -1382,8 +1406,8 @@ class HMSLApp(*_APP_BASES):
         meta = ctk.CTkFrame(parent, fg_color="#2a2a2a", corner_radius=10)
         meta.pack(fill="x", padx=8, pady=8)
         rows = [
-            ("加载器", inst.get("type", "未知")),
-            ("游戏版本", inst.get("version", "未知")),
+            ("加载器", inst.get("type") or "未知"),
+            ("游戏版本", inst.get("version") or "未知"),
             ("EULA", "✅ 已同意" if inst.get("eula") else "⚠️ 待同意"),
             ("路径", _short_path(inst["path"], 65)),
         ]
@@ -1473,8 +1497,8 @@ class HMSLApp(*_APP_BASES):
             seen[abs_path] = {
                 "name": entry.name or os.path.basename(abs_path),
                 "path": abs_path,
-                "version": entry.mc_version or "未知版本",
-                "type": entry.loader or "未知类型",
+                "version": entry.mc_version or None,
+                "type": entry.loader or None,
                 "eula": os.path.isfile(os.path.join(abs_path, "eula.txt")),
             }
         return list(seen.values())
@@ -1538,8 +1562,8 @@ class HMSLApp(*_APP_BASES):
         # Pull mc_version + loader from registry where available; the scanner
         # alone doesn't know these for legacy instances created before HMSL.
         inst = self.selected_instance
-        mc_version = inst.get("version") if inst.get("version") not in (None, "", "未知版本") else None
-        loader = inst.get("type") if inst.get("type") not in (None, "", "未知类型", "已识别实例") else None
+        mc_version = inst.get("version") or None
+        loader = inst.get("type") or None
         ModBrowserWindow(self, inst["name"], inst["path"], mc_version=mc_version, loader=loader)
 
     def _action_remove_or_uninstall(self):
@@ -1810,28 +1834,76 @@ def _route_to(app: "HMSLApp", route: str) -> None:
         print(f"[route_to] 找不到名为 {name!r} 的实例")
 
 
-def _snap_and_quit(app, out_path: str) -> None:
-    """Bring HMSL window to front, screencapture just its bounds, quit.
-    Used by tools/snap.py so Claude can iterate on UI without bothering the user."""
-    import subprocess as _sp
+def _own_cg_window_id(app):
+    """本进程主窗口的 CGWindowID —— 给 screencapture -l 精确抓窗口内容用
+    （无视其它 App 遮挡）。拿不到返回 None，调用方回退区域截图。"""
     try:
+        import Quartz
+    except Exception:
+        return None
+    pid = os.getpid()
+    try:
+        wins = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionAll, Quartz.kCGNullWindowID) or []
+    except Exception:
+        return None
+    best_id, best_area = None, 0
+    for w in wins:
+        if w.get("kCGWindowOwnerPID") != pid:
+            continue
+        b = w.get("kCGWindowBounds") or {}
+        area = (b.get("Width") or 0) * (b.get("Height") or 0)
+        if area > best_area:                       # 取本进程最大的窗口
+            best_area, best_id = area, w.get("kCGWindowNumber")
+    return best_id
+
+
+def _snap_and_quit(app, out_path: str) -> None:
+    """截 HMSL 主窗口到 out_path 后退出。tools/snap.py 用它做无人值守 UI 迭代。
+
+    两段式：先用 AppKit 把本 App 激活成前台 key 窗口（否则 macOS 推迟 label 文字
+    绘制，截到空横幅/空字段 + 上一页残影），**延迟一拍**让 run loop 真正 key 化并
+    画好文字，再用 CGWindowID 精确抓窗口（无视遮挡）。"""
+    import subprocess as _sp
+
+    def _capture():
+        try:
+            for _ in range(3):
+                app.lift(); app.update_idletasks(); app.update()
+            wid = _own_cg_window_id(app)
+            if wid:
+                # -l <id>：抓指定窗口自身内容，无视 z-order/遮挡；-o 去窗口阴影。
+                _sp.run(["screencapture", "-x", "-o", "-l", str(wid), out_path],
+                        check=False)
+            else:
+                # 回退：按屏幕区域抓（依赖窗口此刻在最前）。
+                x, y = app.winfo_rootx(), app.winfo_rooty()
+                w, h = app.winfo_width(), app.winfo_height()
+                y_pad = 28                          # 把 macOS 标题栏也带进来
+                _sp.run(["screencapture", "-x", "-R",
+                         f"{x},{max(0, y - y_pad)},{w},{h + y_pad}", out_path],
+                        check=False)
+        except Exception as e:
+            print(f"[snap_and_quit] capture error: {e}")
+        finally:
+            app.after(50, app.quit)
+
+    # 激活成前台（应用激活“自己”无需任何权限），然后给 run loop ~0.5s 真正 key 化
+    # 并触发文字绘制，再截 —— activateIgnoringOtherApps_ 是异步的，立刻截会太早。
+    try:
+        from AppKit import NSApplication
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+    except Exception:
+        pass
+    try:
+        app.deiconify()
         app.attributes("-topmost", True)
         app.lift()
         app.focus_force()
         app.update()
-        # Tk reports content rect; on macOS the OS adds a ~28px title bar above.
-        # winfo_rootx/y already accounts for title bar position in Aqua so this works.
-        x, y = app.winfo_rootx(), app.winfo_rooty()
-        w, h = app.winfo_width(), app.winfo_height()
-        # Pad up a bit to include the macOS title bar in the shot
-        y_pad = 28
-        _sp.run(["screencapture", "-x", "-R",
-                 f"{x},{max(0, y - y_pad)},{w},{h + y_pad}", out_path],
-                check=False)
-    except Exception as e:
-        print(f"[snap_and_quit] error: {e}")
-    finally:
-        app.after(50, app.quit)
+    except Exception:
+        pass
+    app.after(500, _capture)
 
 
 if __name__ == "__main__":
@@ -1848,6 +1920,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     app = HMSLApp()
+    if args.snap:
+        # 截图模式：一启动就把窗口置顶，给 WM 充足时间把它浮到其它 App 之上。
+        # screencapture -R 抓的是屏幕区域，HMSL 必须真在最前才拍得到；只在
+        # 截图前一刻才 assert topmost 在 macOS 上是抢不过前台 App 的（会拍到
+        # 盖在上面的窗口）。
+        try:
+            app.attributes("-topmost", True)
+            app.lift()
+        except Exception:
+            pass
     if args.route:
         app.after(300, lambda: _route_to(app, args.route))
     if args.snap:

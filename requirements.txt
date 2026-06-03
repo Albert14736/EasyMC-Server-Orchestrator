@@ -4,3 +4,7 @@ tkinterdnd2>=0.4.0
 
 # Dev only
 pytest>=8.0.0
+# tools/snap.py 自动截图用（仅 macOS）。py3.8 锁 9.2：新版 pyobjc 已弃 3.8。
+# 普通运行/PyInstaller 打包不需要 —— gui_main 只在 --snap 模式按需 import。
+pyobjc-framework-Quartz==9.2; sys_platform == "darwin"
+pyobjc-framework-Cocoa==9.2; sys_platform == "darwin"
