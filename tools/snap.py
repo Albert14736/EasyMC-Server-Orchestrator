@@ -2,6 +2,9 @@
 """
 HMSL GUI 自动截图工具 —— 给 Claude 用的，省去人工截图。
 
+姊妹工具：tools/dump.py（出文字：控件树+按钮接线审计，治滚动表单空白/按钮忘接线）、
+         tools/sheet.py（把多页截图拼成一张联络图，省图片 token）。
+
 Usage:
     python tools/snap.py [ROUTE] [OUTPUT_PNG] [SETTLE]
 

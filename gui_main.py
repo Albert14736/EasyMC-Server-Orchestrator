@@ -5,6 +5,8 @@ import sys
 import threading
 import queue
 import time
+import traceback
+import tkinter as tk
 from tkinter import filedialog
 from core.env_manager import EnvManager
 from core.server_installer import ServerInstaller
@@ -854,6 +856,23 @@ def _enable_macos_trackpad_scroll(scrollable_frame: ctk.CTkScrollableFrame) -> N
     bind_recursive(scrollable_frame)
 
 
+def _rlog(msg):
+    """渲染计时探针：追加一行到 /tmp/hmsl_render.log（每行即写即刷，卡死也不丢）。"""
+    try:
+        with open("/tmp/hmsl_render.log", "a") as f:
+            f.write(msg + "\n")
+    except OSError:
+        pass
+
+
+def _safe_listdir(path):
+    """os.listdir 的兜底版：目录不存在/无权限时返回 []，不抛 OSError。"""
+    try:
+        return sorted(os.listdir(path))
+    except OSError:
+        return []
+
+
 def _backup_then_write(path, content_str):
     """Save with a .bak side-copy of the previous version (safety net)."""
     if os.path.isfile(path):
@@ -1090,6 +1109,7 @@ class _FilePickerEditor(ctk.CTkFrame):
         self.server_path = server_path
         self.app = app
         self.current_file = None
+        self._items = []            # 与 Listbox 行一一对应的 (label, full_path)
         self._build_ui()
         self._refresh_file_list()
 
@@ -1097,11 +1117,31 @@ class _FilePickerEditor(ctk.CTkFrame):
         body = ctk.CTkFrame(self, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=4, pady=4)
 
-        left = ctk.CTkFrame(body, fg_color="#2a2a2a", corner_radius=8)
+        left = ctk.CTkFrame(body, fg_color="#2a2a2a", corner_radius=8, width=264)
         left.pack(side="left", fill="y", padx=(0, 6))
+        left.pack_propagate(False)              # 固定左栏宽度
         self._build_top_controls(left)
-        self.file_list = ctk.CTkScrollableFrame(left, width=240, fg_color="transparent")
-        self.file_list.pack(fill="both", expand=True, padx=4, pady=4)
+        # 文件列表用原生 tk.Listbox（单控件承载 N 行、Tk 内置行虚拟化、只画可见行）。
+        # 旧实现给每个文件建一个 ctk.CTkButton —— 数百个 config 文件时，这些重控件首次
+        # 变可见会被迫一次性绘制，冻死主线程（大整合包进配置页/点模组子标签卡死的根因）。
+        list_holder = ctk.CTkFrame(left, fg_color="transparent")
+        list_holder.pack(fill="both", expand=True, padx=4, pady=4)
+        sb = tk.Scrollbar(list_holder)
+        sb.pack(side="right", fill="y")
+        self.file_list = tk.Listbox(
+            list_holder, activestyle="none", exportselection=False,
+            bg="#2a2a2a", fg="#dddddd",
+            selectbackground="#3a5570", selectforeground="white",
+            highlightthickness=0, borderwidth=0, relief="flat",
+            font=("Menlo", 11), yscrollcommand=sb.set)
+        self.file_list.pack(side="left", fill="both", expand=True)
+        sb.config(command=self.file_list.yview)
+        self.file_list.bind("<<ListboxSelect>>", self._on_select)
+        self.file_list.bind("<Double-Button-1>", self._on_select)   # 同一行重选也能打开
+        # macOS 双指滚动（Listbox 原生 <MouseWheel>，delta 为小整数）
+        self.file_list.bind(
+            "<MouseWheel>",
+            lambda e: (self.file_list.yview_scroll(int(-1 * e.delta), "units"), "break")[-1])
 
         right = ctk.CTkFrame(body, fg_color="transparent")
         right.pack(side="left", fill="both", expand=True)
@@ -1131,17 +1171,28 @@ class _FilePickerEditor(ctk.CTkFrame):
         return []   # returns list of (display_label, full_path)
 
     def _refresh_file_list(self):
-        for w in self.file_list.winfo_children(): w.destroy()
-        items = self._list_files()
-        if not items:
-            ctk.CTkLabel(self.file_list, text="(无可编辑文件)",
-                         text_color="gray").pack(pady=20)
+        self.file_list.delete(0, "end")
+        self._items = self._list_files()
+        if not self._items:
+            self.file_list.insert("end", self._empty_hint())
+            self.file_list.itemconfig(0, foreground="#888888")
+            self._items = []        # 提示行不对应文件；_on_select 按长度跳过
             return
-        for label, full in items:
-            ctk.CTkButton(self.file_list, text=label, anchor="w",
-                          fg_color="transparent", text_color="white",
-                          hover_color="#3a3a3a", height=28,
-                          command=lambda fp=full: self._open_file(fp)).pack(fill="x", pady=1, padx=2)
+        for label, _full in self._items:
+            self.file_list.insert("end", label)
+
+    def _on_select(self, _evt=None):
+        sel = self.file_list.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if idx >= len(self._items):   # 空态提示行，无对应文件
+            return
+        self._open_file(self._items[idx][1])
+
+    def _empty_hint(self):
+        """子类可覆盖，按场景给更具体的空态文案。"""
+        return "(无可编辑文件)"
 
     def _open_file(self, path):
         try:
@@ -1190,10 +1241,8 @@ class WorldConfigEditor(_FilePickerEditor):
                           command=lambda _v: self._refresh_file_list()).pack(padx=8, pady=(0, 8))
 
     def _discover_worlds(self):
-        if not os.path.isdir(self.server_path):
-            return []
         out = []
-        for name in sorted(os.listdir(self.server_path)):
+        for name in _safe_listdir(self.server_path):
             d = os.path.join(self.server_path, name)
             if os.path.isdir(d) and os.path.isfile(os.path.join(d, "level.dat")):
                 out.append(name)
@@ -1206,13 +1255,12 @@ class WorldConfigEditor(_FilePickerEditor):
         out = []
         # Forge per-world configs live under serverconfig/
         sc = os.path.join(world_dir, "serverconfig")
-        if os.path.isdir(sc):
-            for f in sorted(os.listdir(sc)):
-                full = os.path.join(sc, f)
-                if os.path.isfile(full) and f.lower().endswith(self.EXTS):
-                    out.append((f"serverconfig/{f}", full))
+        for f in _safe_listdir(sc):
+            full = os.path.join(sc, f)
+            if os.path.isfile(full) and f.lower().endswith(self.EXTS):
+                out.append((f"serverconfig/{f}", full))
         # Editable text files at world root
-        for f in sorted(os.listdir(world_dir)):
+        for f in _safe_listdir(world_dir):
             full = os.path.join(world_dir, f)
             if os.path.isfile(full) and f.lower().endswith(self.EXTS):
                 out.append((f, full))
@@ -1227,13 +1275,20 @@ class ModConfigEditor(_FilePickerEditor):
         if not os.path.isdir(cfg_root):
             return []
         out = []
-        for dirpath, _dirs, files in os.walk(cfg_root):
+        # onerror=忽略：个别子目录无权限不该让整页崩
+        for dirpath, _dirs, files in os.walk(cfg_root, onerror=lambda _e: None):
             for f in sorted(files):
                 if f.lower().endswith(self.EXTS):
                     full = os.path.join(dirpath, f)
                     rel = os.path.relpath(full, cfg_root)
                     out.append((rel, full))
         return out
+
+    def _empty_hint(self):
+        cfg_root = os.path.join(self.server_path, "config")
+        if not os.path.isdir(cfg_root):
+            return "（还没有 config/ 目录，装模组或启动一次后才会生成）"
+        return "（config/ 下暂无可编辑的文本配置文件）"
 
 
 # Standard tkinterdnd2-with-CustomTkinter integration: declare a mixin class so
@@ -1289,13 +1344,34 @@ class HMSLApp(*_APP_BASES):
             self.dnd_bind("<<Drop>>", self._on_file_dropped)
 
     def clear_main_frame(self):
+        self._stop_heartbeat()
         for widget in self.main_frame.winfo_children(): widget.destroy()
+
+    # ---- 渲染卡死诊断：心跳探针 ----
+    def _start_heartbeat(self):
+        self._stop_heartbeat()
+        self._hb_n = 0
+        self._hb()
+
+    def _hb(self):
+        self._hb_n = getattr(self, "_hb_n", 0) + 1
+        _rlog(f"  ·hb {self._hb_n}")
+        self._hb_after = self.after(500, self._hb)
+
+    def _stop_heartbeat(self):
+        a = getattr(self, "_hb_after", None)
+        if a is not None:
+            try:
+                self.after_cancel(a)
+            except Exception:
+                pass
+            self._hb_after = None
 
     def show_home(self):
         self.clear_main_frame()
         ctk.CTkLabel(self.main_frame, text="欢迎使用 HMSL", font=ctk.CTkFont(size=32, weight="bold")).pack(pady=(60, 10))
         ctk.CTkLabel(self.main_frame, text="专业、极简、高效的一键式开服管理中心", text_color="gray", font=ctk.CTkFont(size=14)).pack(pady=(0, 30))
-        self.start_btn = ctk.CTkButton(self.main_frame, text="🚀 开启服务器", width=300, height=90, corner_radius=45, font=ctk.CTkFont(size=26, weight="bold"))
+        self.start_btn = ctk.CTkButton(self.main_frame, text="🚀 开启服务器", width=300, height=90, corner_radius=45, font=ctk.CTkFont(size=26, weight="bold"), command=self._home_start_clicked)
         self.start_btn.pack(pady=20)
         info_card = ctk.CTkFrame(self.main_frame, width=420, height=120, corner_radius=15)
         info_card.pack(pady=30, padx=40); info_card.pack_propagate(False)
@@ -1305,6 +1381,15 @@ class HMSLApp(*_APP_BASES):
             ctk.CTkLabel(self.main_frame,
                          text="💡 把 .mrpack / .zip 整合包拖到窗口里也能直接导入",
                          text_color="#777", font=ctk.CTkFont(size=12)).pack(pady=(10, 0))
+
+    def _home_start_clicked(self):
+        """首页「🚀 开启服务器」：有已选实例就回它的详情页（可点▶启动），
+        否则去实例列表让用户挑一台。首页本身没有选择状态，故不直接启动。"""
+        inst = getattr(self, "selected_instance", None)
+        if inst:
+            self.show_instance_detail(inst, initial_tab="概览")
+        else:
+            self.show_versions()
 
     def _on_file_dropped(self, event):
         """tkinterdnd2 emits a string like '{/path/with spaces/x.mrpack} /other/y.zip'.
@@ -1355,8 +1440,9 @@ class HMSLApp(*_APP_BASES):
 
     # ===== Instance detail page (HMCL-style) =====
 
-    def show_instance_detail(self, inst, initial_tab="概览"):
-        """详情页：← 返回 + 实例信息头 + Tab 容器（概览 / 配置 / ...）。"""
+    def show_instance_detail(self, inst, initial_tab="概览", active_sub=None):
+        """详情页：← 返回 + 实例信息头 + Tab 容器（概览 / 配置 / ...）。
+        active_sub：可选，指定「配置」tab 内默认激活哪个子标签（路由/测试用）。"""
         self.clear_main_frame()
         self.selected_instance = inst  # legacy action methods read this
 
@@ -1375,22 +1461,51 @@ class HMSLApp(*_APP_BASES):
                      font=ctk.CTkFont(size=11), text_color="gray",
                      anchor="w").pack(anchor="w")
 
-        # --- Tabview ---
-        tabs = ctk.CTkTabview(self.main_frame, fg_color="#1d1d1d")
+        # --- Tabview（懒加载）---
+        # 关键：只构建/绘制【当前激活】tab 的内容。一次性把概览+配置(server.properties
+        # ~80 控件 + 世界 + 模组)全渲染，在真前台窗口下会一次性绘制几百个控件冻死 UI
+        # （snap 工具在非 key 窗口下推迟绘制，所以测不出来——这是之前漏判的根因）。
+        tabs = ctk.CTkTabview(self.main_frame, fg_color="#1d1d1d",
+                              command=self._lazy_build_detail_tab)
         tabs.pack(fill="both", expand=True, padx=10, pady=10)
+        self._detail_tabs = tabs
+        self._detail_inst = inst
+        self._detail_active_sub = active_sub
+        self._detail_tab_built = set()
+        try:
+            with open("/tmp/hmsl_render.log", "w") as _f:
+                _f.write(f"=== 详情页 {inst.get('name')} ===\n")
+        except OSError:
+            pass
         tabs.add("概览")
         tabs.add("配置")
-        # 先把目标 tab 设为激活（此时 frame 还空，切换最干净），再渲染内容 —— 把重
-        # 内容塞进未激活 tab 之后再 set() 会触发 CTkTabview“按钮切了内容没切”的时序
-        # bug（main_frame 撑满高度后更易复现）。
         try:
             tabs.set(initial_tab)
         except Exception:
             pass
-        self._render_overview_tab(tabs.tab("概览"), inst)
-        self._render_config_tab(tabs.tab("配置"), inst)
-        # 渲染后再确认一次，防止渲染过程内部又改动了可见 frame。
+        self._lazy_build_detail_tab()              # 只建初始激活的 tab
         tabs.after_idle(lambda: tabs.set(initial_tab))
+        self._start_heartbeat()                    # 诊断：心跳，卡死即停
+
+    def _lazy_build_detail_tab(self):
+        """详情页外层 tab 懒加载：首次显示某 tab 才渲染其内容（再次切回不重建）。"""
+        tabs = self._detail_tabs
+        name = tabs.get()
+        if name in self._detail_tab_built:
+            return
+        self._detail_tab_built.add(name)
+        frame = tabs.tab(name)
+        t0 = time.perf_counter()
+        if name == "概览":
+            self._render_overview_tab(frame, self._detail_inst)
+        elif name == "配置":
+            self._render_config_tab(frame, self._detail_inst,
+                                    active_sub=self._detail_active_sub)
+        try:
+            with open("/tmp/hmsl_render.log", "a") as _f:
+                _f.write(f"[外层tab] {name}  +{time.perf_counter()-t0:.3f}s\n")
+        except OSError:
+            pass
 
     # --- Overview tab ---
 
@@ -1458,16 +1573,61 @@ class HMSLApp(*_APP_BASES):
 
     # --- Config tab (with 3 sub-tabs) ---
 
-    def _render_config_tab(self, parent, inst):
-        """配置中心：3 个 sub-tab —— server.properties / 世界 / 模组。"""
-        sub = ctk.CTkTabview(parent, fg_color="#2a2a2a")
+    def _render_config_tab(self, parent, inst, active_sub=None):
+        """配置中心：3 个 sub-tab —— server.properties / 世界 / 模组。
+        懒加载：点哪个子标签才构建哪个编辑器，避免一次性绘制
+        server.properties(~80控件)+世界+模组 在前台窗口冻死 UI。"""
+        sub = ctk.CTkTabview(parent, fg_color="#2a2a2a",
+                             command=self._lazy_build_config_subtab)
         sub.pack(fill="both", expand=True, padx=4, pady=4)
-        sub.add("🌐 server.properties")
-        sub.add("🌍 世界")
-        sub.add("🔧 模组")
-        self._render_server_properties_subtab(sub.tab("🌐 server.properties"), inst)
-        self._render_world_config_subtab(sub.tab("🌍 世界"), inst)
-        self._render_mod_config_subtab(sub.tab("🔧 模组"), inst)
+        self._cfg_subtabview = sub          # 供路由/测试激活某个子标签
+        self._cfg_inst = inst
+        self._cfg_subtab_built = set()
+        self._cfg_subtab_factories = {
+            "🌐 server.properties": self._render_server_properties_subtab,
+            "🌍 世界": self._render_world_config_subtab,
+            "🔧 模组": self._render_mod_config_subtab,
+        }
+        for name in self._cfg_subtab_factories:
+            sub.add(name)
+        try:
+            sub.set(active_sub or "🌐 server.properties")
+        except Exception:
+            pass
+        self._lazy_build_config_subtab()    # 只建当前激活的子编辑器
+
+    def _lazy_build_config_subtab(self):
+        """配置子标签懒加载：首次显示某子标签才构建其编辑器；带计时日志。
+        任一编辑器构造失败只在该子标签内显示错误，不冲断整页、不影响返回。"""
+        sub = self._cfg_subtabview
+        name = sub.get()
+        _rlog(f"→ 切到子标签 {name}")
+        if name in self._cfg_subtab_built:
+            _rlog(f"  ({name} 已建过，跳过)")
+            return
+        self._cfg_subtab_built.add(name)
+        factory = self._cfg_subtab_factories.get(name)
+        if factory is None:
+            return
+        tabframe = sub.tab(name)
+        t0 = time.perf_counter()
+        try:
+            factory(tabframe, self._cfg_inst)
+        except Exception as e:
+            ctk.CTkLabel(
+                tabframe,
+                text=f"⚠️ 此配置加载失败：\n{type(e).__name__}: {e}\n\n"
+                     f"其它子标签和「← 返回列表」仍可正常使用。",
+                text_color="#e06c6c", justify="left",
+                font=ctk.CTkFont(size=12)).pack(padx=20, pady=20, anchor="w")
+            traceback.print_exc()
+        tb = time.perf_counter()
+        _rlog(f"[配置子标签] {name}  build+{tb-t0:.3f}s  …开始draw")
+        try:
+            tabframe.update_idletasks()   # 强制立即绘制刚建的控件，隔离“绘制”耗时
+        except Exception:
+            pass
+        _rlog(f"[配置子标签] {name}  draw+{time.perf_counter()-tb:.3f}s  ✓完成")
 
     def _render_server_properties_subtab(self, parent, inst):
         """server.properties 可视化编辑 + 未知 key 走 raw 文本框。"""
@@ -1816,6 +1976,7 @@ def _route_to(app: "HMSLApp", route: str) -> None:
         home, versions, download
         detail:<instance_name>
         config:<instance_name>          (detail page + 配置 tab active)
+        modcfg:<instance_name>          (配置 tab + 内层「🔧 模组」子标签 active)
     """
     if not route:
         return
@@ -1824,12 +1985,16 @@ def _route_to(app: "HMSLApp", route: str) -> None:
     if page == "home":      app.show_home(); return
     if page == "versions":  app.show_versions(); return
     if page == "download":  app.show_download(); return
-    if page in ("detail", "config") and len(parts) == 2:
+    if page in ("detail", "config", "modcfg") and len(parts) == 2:
         name = parts[1]
         for inst in app._collect_instances():
             if inst["name"] == name:
-                initial_tab = "配置" if page == "config" else "概览"
-                app.show_instance_detail(inst, initial_tab=initial_tab)
+                initial_tab = "概览" if page == "detail" else "配置"
+                # modcfg：直接把内层激活子标签设为「🔧 模组」，让模组文件列表真正
+                # 变可见（卡死就发生在这一刻——验证 Listbox 改造后不再冻）。
+                active_sub = "🔧 模组" if page == "modcfg" else None
+                app.show_instance_detail(inst, initial_tab=initial_tab,
+                                         active_sub=active_sub)
                 return
         print(f"[route_to] 找不到名为 {name!r} 的实例")
 
@@ -1856,6 +2021,102 @@ def _own_cg_window_id(app):
         if area > best_area:                       # 取本进程最大的窗口
             best_area, best_id = area, w.get("kCGWindowNumber")
     return best_id
+
+
+def _widget_text(w) -> str:
+    """尽力取控件的显示文字（CTk 存在 ._text，原生 tk 用 cget('text')）。"""
+    try:
+        v = getattr(w, "_text", None)
+        if isinstance(v, str) and v:
+            return v
+    except Exception:
+        pass
+    try:
+        t = w.cget("text")
+        if isinstance(t, str) and t:
+            return t
+    except Exception:
+        pass
+    return ""
+
+
+def _widget_command_state(w) -> str:
+    """'YES'/'NO' 表示这是个带 command 的按钮且是否已绑；'' 表示不是按钮。"""
+    try:
+        import customtkinter as _ctk
+        if isinstance(w, _ctk.CTkButton):
+            return "YES" if getattr(w, "_command", None) else "NO"
+    except Exception:
+        pass
+    try:
+        import tkinter as _tk
+        if isinstance(w, _tk.Button):
+            return "YES" if str(w.cget("command")).strip() else "NO"
+    except Exception:
+        pass
+    return ""
+
+
+def _dump_tree_and_quit(app, out_path: str) -> None:
+    """把控件树 + 按钮接线审计写成纯文本到 out_path 后退出 —— 给 tools/dump.py 用。
+
+    读的是控件『配置的文字/回调』而非像素，所以：
+      1) 不受 macOS 后台进程推迟文字绘制的影响（滚动表单也能核实内容）；
+      2) 能直接查出『按钮没绑 command』这类接线 bug，纯文本 diff，几乎不花 token。
+    """
+    lines, buttons = [], []
+
+    def walk(w, depth):
+        cls = w.__class__.__name__
+        text = _widget_text(w)
+        cmd = _widget_command_state(w)
+        try:
+            mapped = 1 if w.winfo_ismapped() else 0
+        except Exception:
+            mapped = 0
+        try:
+            geom = f"{w.winfo_width()}x{w.winfo_height()}+{w.winfo_x()}+{w.winfo_y()}"
+        except Exception:
+            geom = "?"
+        row = ["  " * depth + cls]
+        if text:
+            row.append(f"text={text!r}")
+        row.append(f"vis={mapped}")
+        row.append(f"geom={geom}")
+        if cmd:
+            row.append(f"cmd={cmd}")
+        lines.append(" ".join(row))
+        if cmd:
+            buttons.append((cmd, mapped, cls, text or "(无文字)"))
+        try:
+            for c in w.winfo_children():
+                walk(c, depth + 1)
+        except Exception:
+            pass
+
+    try:
+        walk(app, 0)
+    except Exception as e:
+        lines.append(f"[dump] walk error: {e}")
+
+    out = ["=== BUTTONS (接线审计) ==="]
+    unwired = 0
+    for cmd, vis, cls, text in buttons:
+        flag = ""
+        if cmd != "YES":
+            flag = "   <== 未绑 command!"
+            unwired += 1
+        out.append(f"[{cmd:3}] vis={vis} {cls:16} {text}{flag}")
+    out.append(f"\n共 {len(buttons)} 个按钮，其中 {unwired} 个未绑 command。")
+    out.append("\n=== TREE ===")
+    out.extend(lines)
+    try:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n")
+        print(out_path)
+    except Exception as e:
+        print(f"[dump] write error: {e}")
+    app.after(50, app.quit)
 
 
 def _snap_and_quit(app, out_path: str) -> None:
@@ -1917,6 +2178,10 @@ if __name__ == "__main__":
                              "Used by tools/snap.py for headless UI iteration.")
     parser.add_argument("--settle", type=float, default=1.5,
                         help="Seconds to wait after route before snapping (default 1.5).")
+    parser.add_argument("--dump-tree", dest="dump_tree", default="",
+                        help="After --route, dump the widget tree + button wiring audit "
+                             "to this PATH (text) and exit. Used by tools/dump.py. "
+                             "No screenshot / no foreground activation needed.")
     args = parser.parse_args()
 
     app = HMSLApp()
@@ -1936,4 +2201,8 @@ if __name__ == "__main__":
         # Run snap AFTER route + settle so the destination page is fully painted
         app.after(int((args.settle + 0.3) * 1000),
                   lambda: _snap_and_quit(app, args.snap))
+    if args.dump_tree:
+        # 控件树 dump：不需要抢前台，路由+settle 后直接遍历控件写文本再退出。
+        app.after(int((args.settle + 0.3) * 1000),
+                  lambda: _dump_tree_and_quit(app, args.dump_tree))
     app.mainloop()
