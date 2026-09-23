@@ -857,12 +857,8 @@ def _enable_macos_trackpad_scroll(scrollable_frame: ctk.CTkScrollableFrame) -> N
 
 
 def _rlog(msg):
-    """渲染计时探针：追加一行到 /tmp/hmsl_render.log（每行即写即刷，卡死也不丢）。"""
-    try:
-        with open("/tmp/hmsl_render.log", "a") as f:
-            f.write(msg + "\n")
-    except OSError:
-        pass
+    """（调试期渲染探针，已停用为空操作；保留函数签名，各调用点无需改动。）"""
+    return
 
 
 def _safe_listdir(path):
@@ -895,8 +891,9 @@ class ServerPropertiesEditor(ctk.CTkFrame):
         self.vars = {}                # key -> StringVar / BooleanVar
         self.original_lines = []      # preserve comments + ordering
         self.raw_textbox = None       # for unknown keys
+        # _build_ui 分批构建字段，建完后由 _finish_form 调 _load 填值（不在此提前调 _load，
+        # 否则 raw_textbox 等还没建好会崩）。
         self._build_ui()
-        self._load()
 
     def _build_ui(self):
         # Top action bar: buttons FIRST on the right (predictable spot)
@@ -908,91 +905,180 @@ class ServerPropertiesEditor(ctk.CTkFrame):
                       command=self._save).pack(side="right")
         ctk.CTkButton(top, text="↻ 重新加载", width=110, height=34,
                       fg_color="#3d3d3d", hover_color="#4d4d4d",
-                      command=self._load).pack(side="right", padx=6)
+                      command=self._reload).pack(side="right", padx=6)
         ctk.CTkLabel(top, text=_short_path(self.properties_path, 60),
                      text_color="gray", font=ctk.CTkFont(size=11),
                      anchor="w").pack(side="left", padx=(4, 8), fill="x", expand=True)
 
-        # 文件缺失横幅：固定在动作栏与表单之间，仅当 server.properties 不存在时
-        # 显示（由 _load 控制 pack/pack_forget）。否则用户看到一排空字段会以为坏了。
-        self.banner = ctk.CTkLabel(
-            self, text="", fg_color="#5a4a2b", corner_radius=8,
-            anchor="w", justify="left", wraplength=620,
-            font=ctk.CTkFont(size=12),
-        )
+        # 文件缺失横幅：改用【原生 tk.Label】（纯色、无圆角、无画布）。原来是带圆角背景
+        # 的 CTkLabel——这种画布绘制的圆角控件疑为 macOS 卡渲染的元凶之一（2026-09-23 用户
+        # 截图显示它渲染成残缺的棕色块）。它只在 server.properties 缺失时显示，而用户测的
+        # 实例恰好都缺，所以每次都触发。
+        self.banner = tk.Label(
+            self, text="", bg="#5a4a2b", fg="#ffe0a3",
+            anchor="w", justify="left", wraplength=880, font=("", 12), padx=10, pady=8)
 
-        # Scrollable form area
-        self.form = ctk.CTkScrollableFrame(self, fg_color="transparent")
-        self.form.pack(fill="both", expand=True, padx=4, pady=4)
+        # ⚠️ Plan C —— 分页显示，不滚动（2026-09-23 用户提议 + 实测确认）。
+        # 根因（computer-use 真鼠标点击 + HMSL_SP 逐层二分实锤）：macOS 的 Cocoa 合成器
+        # 在一次性渲染"比窗口高、超出可视区"的一堆控件时，会把整个窗口卡死——CTk / 原生
+        # tk 都会，与控件类型无关，是"控件铺得超出窗口"本身。「世界/模组」页不卡，是因为
+        # 它们把内容装进【一个能自我虚拟化的控件】(tk.Listbox / CTkTextbox) 里，只画看得
+        # 见的部分。这里照此思路：每页只放放得下窗口的少量字段（永不溢出），翻页看下一批。
+        # Windows(GDI) 基本无此坑，此方案两平台通吃。
+        self._init_vars()
+        self._sp_pages = self._paginate(fields_per_page=6)
+        self._sp_page_idx = 0
+        self._unknown_text = ""
+        self.raw_textbox = None
 
-        # Build all known fields
-        for group_name, fields in _SERVER_PROP_GROUPS:
-            ctk.CTkLabel(self.form, text=group_name,
-                         font=ctk.CTkFont(size=14, weight="bold"),
-                         anchor="w").pack(anchor="w", pady=(12, 4), padx=4)
+        self._page_frame = tk.Frame(self, bg="#2a2a2a", highlightthickness=0)
+        self._page_frame.pack(fill="both", expand=True, padx=4, pady=4)
+
+        nav = tk.Frame(self, bg="#242424", highlightthickness=0)
+        nav.pack(fill="x", padx=4, pady=(0, 4))
+        self._prev_btn = tk.Button(nav, text="◀ 上一页", command=self._sp_prev,
+                                   bg="#3a3a3a", fg="#dddddd", activebackground="#4a4a4a",
+                                   activeforeground="white", relief="flat", bd=0,
+                                   highlightthickness=0, padx=14, pady=4)
+        self._prev_btn.pack(side="left", padx=6, pady=6)
+        self._next_btn = tk.Button(nav, text="下一页 ▶", command=self._sp_next,
+                                   bg="#3a3a3a", fg="#dddddd", activebackground="#4a4a4a",
+                                   activeforeground="white", relief="flat", bd=0,
+                                   highlightthickness=0, padx=14, pady=4)
+        self._next_btn.pack(side="right", padx=6, pady=6)
+        self._page_lbl = tk.Label(nav, text="", bg="#242424", fg="#aaaaaa", font=("", 12))
+        self._page_lbl.pack(side="left", expand=True)
+
+        self._load()               # 先把值填进 vars（控件还没建也没关系）
+        self._show_sp_page(0)      # 建第一页
+
+    def _init_vars(self):
+        """预建所有字段变量，与控件解耦：翻页时控件重建，但值一直存在 self.vars 里，
+        所以在哪一页填的值、保存时都在，不会因为没翻到某页而丢。"""
+        for _group, fields in _SERVER_PROP_GROUPS:
             for spec in fields:
-                self._build_field(spec)
+                kind, key = spec[0], spec[1]
+                self.vars[key] = (tk.BooleanVar(value=False) if kind == "bool"
+                                  else tk.StringVar(value=""))
 
-        # Raw / unknown section header (filled in _load)
-        self.unknown_header = ctk.CTkLabel(
-            self.form, text="其他 (高级 / 未知字段)",
-            font=ctk.CTkFont(size=14, weight="bold"), anchor="w",
-        )
-        self.unknown_header.pack(anchor="w", pady=(20, 4), padx=4)
-        ctk.CTkLabel(self.form,
-                     text="按 key=value 一行一个；保存时会与上面的可视化字段合并写入。",
-                     text_color="gray", font=ctk.CTkFont(size=11),
-                     anchor="w").pack(anchor="w", padx=4)
-        self.raw_textbox = ctk.CTkTextbox(self.form, height=120,
-                                           fg_color="#000000",
-                                           text_color="#cccccc",
-                                           font=("Menlo", 11))
-        self.raw_textbox.pack(fill="x", padx=4, pady=(4, 12))
+    def _paginate(self, fields_per_page=6):
+        """把 (组名, 字段) 展平后按每页 fields_per_page 个字段切页。返回 [[(group, spec)...]...]。"""
+        flat = [(group, spec) for group, fields in _SERVER_PROP_GROUPS for spec in fields]
+        pages = [flat[i:i + fields_per_page]
+                 for i in range(0, len(flat), fields_per_page)]
+        return pages or [[]]
 
-        # macOS trackpad scroll: rebind after all children exist.
-        # after_idle ensures Tk has finished mapping the widgets first.
-        self.after_idle(lambda: _enable_macos_trackpad_scroll(self.form))
+    def _show_sp_page(self, idx):
+        """显示第 idx 页：销毁旧页、只建这一页的少量字段（放得下窗口、永不溢出）。"""
+        n = len(self._sp_pages)
+        idx = max(0, min(idx, n - 1))
+        self._sync_unknown_from_box()      # 翻走前存回 raw 框内容
+        self._sp_page_idx = idx
+        for c in self._page_frame.winfo_children():
+            c.destroy()
+        self.raw_textbox = None
+        last_group = None
+        for group, spec in self._sp_pages[idx]:
+            if group != last_group:
+                tk.Label(self._page_frame, text=group, bg="#2a2a2a", fg="#dddddd",
+                         font=("", 14, "bold"), anchor="w").pack(
+                    anchor="w", pady=(10, 4), padx=6)
+                last_group = group
+            self._build_field(spec)
+        if idx == n - 1:               # 最后一页附"未知字段"raw 编辑区
+            self._build_raw_section()
+        self._page_lbl.configure(text=f"第 {idx + 1} / {n} 页")
+        self._prev_btn.configure(state="normal" if idx > 0 else "disabled")
+        self._next_btn.configure(state="normal" if idx < n - 1 else "disabled")
+
+    def _sp_prev(self):
+        self._show_sp_page(self._sp_page_idx - 1)
+
+    def _sp_next(self):
+        self._show_sp_page(self._sp_page_idx + 1)
+
+    def _reload(self):
+        """↻ 重新加载：重读文件填值，再重建当前页。"""
+        self._load()
+        self._show_sp_page(self._sp_page_idx)
+
+    def _build_raw_section(self):
+        tk.Label(self._page_frame, text="其他 (高级 / 未知字段)", bg="#2a2a2a",
+                 fg="#dddddd", font=("", 14, "bold"), anchor="w").pack(
+            anchor="w", pady=(14, 4), padx=6)
+        tk.Label(self._page_frame, bg="#2a2a2a", fg="#888888", font=("", 11), anchor="w",
+                 text="按 key=value 一行一个；保存时会与上面的可视化字段合并写入。").pack(
+            anchor="w", padx=6)
+        self.raw_textbox = ctk.CTkTextbox(self._page_frame, height=140,
+                                          fg_color="#000000", text_color="#cccccc",
+                                          font=("Menlo", 11))
+        self.raw_textbox.pack(fill="both", expand=True, padx=4, pady=(4, 8))
+        self.raw_textbox.delete("1.0", "end")
+        self.raw_textbox.insert("1.0", self._unknown_text)
+
+    def _sync_unknown_from_box(self):
+        """若 raw 框当前在屏，把它的内容存回 self._unknown_text（翻页/保存前调用）。"""
+        try:
+            if self.raw_textbox is not None and self.raw_textbox.winfo_exists():
+                self._unknown_text = self.raw_textbox.get("1.0", "end-1c")
+        except Exception:
+            pass
 
     def _build_field(self, spec):
+        # ⚠️ 全部用【原生 tk 控件】而不是 CTk 控件。控制变量对比（2026-09-23 用户实测）：
+        # 「世界/模组」页用原生 tk（不卡），本页原来用 ~77 个 CTk 控件（每个内部带自绘画布、
+        # 很重），大半还在窗口外，macOS 一次性合成就卡死。换成轻量原生 tk 后即与那两页同构。
         kind = spec[0]
-        row = ctk.CTkFrame(self.form, fg_color="transparent")
-        row.pack(fill="x", padx=4, pady=2)
+        key = spec[1]
+        var = self.vars[key]        # 变量已在 _init_vars 预建，这里只建控件并绑上去
+        BG, FG, GRAY, EBG = "#2a2a2a", "#dddddd", "#888888", "#3a3a3a"
+        row = tk.Frame(self._page_frame, bg=BG)
+        row.pack(fill="x", padx=6, pady=3)
+
+        def _hint(text):
+            if text:
+                tk.Label(row, text=text, bg=BG, fg=GRAY, font=("", 11),
+                         anchor="w").pack(side="left", padx=(4, 0))
+
+        def _entry(width):
+            tk.Entry(row, textvariable=var, width=width, bg=EBG, fg=FG,
+                     insertbackground=FG, relief="flat", highlightthickness=1,
+                     highlightbackground="#4a4a4a", highlightcolor="#5a8cc0").pack(
+                side="left", padx=(0, 8))
+
         if kind == "bool":
-            _k, key, label, hint = spec
-            var = ctk.BooleanVar(value=False)
-            cb = ctk.CTkCheckBox(row, text=label, variable=var, width=240)
-            cb.pack(side="left", padx=(4, 8))
-            if hint:
-                ctk.CTkLabel(row, text=hint, text_color="gray",
-                             font=ctk.CTkFont(size=11)).pack(side="left")
-            self.vars[key] = var
+            _k, _key, label, hint = spec
+            tk.Checkbutton(row, text=label, variable=var, bg=BG, fg=FG,
+                           selectcolor=EBG, activebackground=BG, activeforeground=FG,
+                           anchor="w", highlightthickness=0, bd=0).pack(
+                side="left", padx=(2, 8))
+            _hint(hint)
         elif kind == "int":
-            _k, key, label, hint, lo, hi = spec
-            ctk.CTkLabel(row, text=label, width=160, anchor="w").pack(side="left", padx=(4, 4))
-            var = ctk.StringVar(value="")
-            ctk.CTkEntry(row, textvariable=var, width=80).pack(side="left", padx=(0, 8))
-            ctk.CTkLabel(row, text=f"({lo}–{hi}) {hint}",
-                         text_color="gray",
-                         font=ctk.CTkFont(size=11)).pack(side="left")
-            self.vars[key] = var
+            _k, _key, label, hint, lo, hi = spec
+            tk.Label(row, text=label, width=16, anchor="w", bg=BG, fg=FG).pack(
+                side="left", padx=(2, 4))
+            _entry(10)
+            _hint(f"({lo}–{hi}) {hint}")
         elif kind == "str":
-            _k, key, label, hint = spec
-            ctk.CTkLabel(row, text=label, width=160, anchor="w").pack(side="left", padx=(4, 4))
-            var = ctk.StringVar(value="")
-            ctk.CTkEntry(row, textvariable=var, width=260).pack(side="left", padx=(0, 8))
-            if hint:
-                ctk.CTkLabel(row, text=hint, text_color="gray",
-                             font=ctk.CTkFont(size=11)).pack(side="left")
-            self.vars[key] = var
+            _k, _key, label, hint = spec
+            tk.Label(row, text=label, width=16, anchor="w", bg=BG, fg=FG).pack(
+                side="left", padx=(2, 4))
+            _entry(32)
+            _hint(hint)
         elif kind == "choice":
-            _k, key, label, hint, options = spec
-            ctk.CTkLabel(row, text=label, width=160, anchor="w").pack(side="left", padx=(4, 4))
-            var = ctk.StringVar(value=options[0])
-            ctk.CTkOptionMenu(row, variable=var, values=options, width=140).pack(side="left", padx=(0, 8))
-            if hint:
-                ctk.CTkLabel(row, text=hint, text_color="gray",
-                             font=ctk.CTkFont(size=11)).pack(side="left")
-            self.vars[key] = var
+            _k, _key, label, hint, options = spec
+            tk.Label(row, text=label, width=16, anchor="w", bg=BG, fg=FG).pack(
+                side="left", padx=(2, 4))
+            if not var.get():
+                var.set(options[0])
+            om = tk.OptionMenu(row, var, *options)
+            om.configure(bg=EBG, fg=FG, activebackground="#4a4a4a", activeforeground=FG,
+                         highlightthickness=0, bd=0, relief="flat", width=12,
+                         anchor="w", takefocus=0)
+            om["menu"].configure(bg=EBG, fg=FG, activebackground="#3a5570",
+                                 activeforeground="white", bd=0)
+            om.pack(side="left", padx=(0, 8))
+            _hint(hint)
 
     def _load(self):
         # Reset all vars to empty
@@ -1007,10 +1093,10 @@ class ServerPropertiesEditor(ctk.CTkFrame):
                 text="⚠️ 这台服务器还没有 server.properties —— 先到「概览」页点 "
                      "▶ 启动 让它生成一次，或直接在下面填好字段点 💾 保存来创建。")
             self.banner.pack(fill="x", padx=4, pady=(0, 8), after=self._top_bar)
-            self.raw_textbox.delete("1.0", "end")
-            self.raw_textbox.insert("1.0",
+            self._unknown_text = (
                 "# server.properties 还不存在 —— 先启动一次服务器就会自动生成；\n"
                 "# 或在此输入 key=value 一行一个，按保存直接创建。\n")
+            self.original_lines = []
             return
 
         # 文件存在 —— 确保横幅隐藏（重新加载时可能从"缺失"切到"存在"）
@@ -1042,13 +1128,12 @@ class ServerPropertiesEditor(ctk.CTkFrame):
             else:
                 var.set(raw)
 
-        # Anything not known → raw textbox
+        # Anything not known → raw 文本（存进 _unknown_text，最后一页的 raw 框会读它）
         unknown_lines = []
         for k, v in parsed.items():
             if k not in known_keys:
                 unknown_lines.append(f"{k}={v}")
-        self.raw_textbox.delete("1.0", "end")
-        self.raw_textbox.insert("1.0", "\n".join(unknown_lines))
+        self._unknown_text = "\n".join(unknown_lines)
 
     def _save(self):
         # Gather final key→value map
@@ -1059,8 +1144,9 @@ class ServerPropertiesEditor(ctk.CTkFrame):
                 final[key] = "true" if val else "false"
             else:
                 final[key] = str(val)
-        # Parse the raw textbox for extra keys
-        for line in self.raw_textbox.get("1.0", "end").splitlines():
+        # Parse the raw text (未知字段) for extra keys —— 先把 raw 框现有内容同步回来
+        self._sync_unknown_from_box()
+        for line in self._unknown_text.splitlines():
             s = line.strip()
             if not s or s.startswith("#") or "=" not in s:
                 continue
@@ -1349,9 +1435,8 @@ class HMSLApp(*_APP_BASES):
 
     # ---- 渲染卡死诊断：心跳探针 ----
     def _start_heartbeat(self):
+        # 调试期心跳探针（卡死即停）已停用；仅确保没有残留计时器。
         self._stop_heartbeat()
-        self._hb_n = 0
-        self._hb()
 
     def _hb(self):
         self._hb_n = getattr(self, "_hb_n", 0) + 1
@@ -1461,51 +1546,43 @@ class HMSLApp(*_APP_BASES):
                      font=ctk.CTkFont(size=11), text_color="gray",
                      anchor="w").pack(anchor="w")
 
-        # --- Tabview（懒加载）---
-        # 关键：只构建/绘制【当前激活】tab 的内容。一次性把概览+配置(server.properties
-        # ~80 控件 + 世界 + 模组)全渲染，在真前台窗口下会一次性绘制几百个控件冻死 UI
-        # （snap 工具在非 key 窗口下推迟绘制，所以测不出来——这是之前漏判的根因）。
-        tabs = ctk.CTkTabview(self.main_frame, fg_color="#1d1d1d",
-                              command=self._lazy_build_detail_tab)
-        tabs.pack(fill="both", expand=True, padx=10, pady=10)
-        self._detail_tabs = tabs
+        # --- 概览/配置 切换：分段按钮 + 内容【内联渲染】---
+        # ⚠️ 每次切换都整页重建（重新调用本方法 → clear_main_frame）。这是 macOS 上
+        # 唯一可靠"上屏"的路径：真鼠标点击后，原地"隐藏/显示"甚至"深层销毁+重建"都
+        # 不触发窗口重绘（内容建好、事件照收，但画面定格，用户狂点无反应——CTkTabview
+        # 的 grid_forget/grid 是同一个坑）；只有 clear_main_frame 整页清空重建才每次都
+        # 重绘。所有顶层导航都走它、从不卡，就是明证（2026-09-23 用 computer-use 真实
+        # 鼠标点击 + 点击记录器逐步实锤）。全 App 也不再有任何 CTkTabview。
         self._detail_inst = inst
         self._detail_active_sub = active_sub
-        self._detail_tab_built = set()
+        active_tab = initial_tab if initial_tab in ("概览", "配置") else "概览"
         try:
             with open("/tmp/hmsl_render.log", "w") as _f:
-                _f.write(f"=== 详情页 {inst.get('name')} ===\n")
+                _f.write(f"=== 详情页 {inst.get('name')} tab={active_tab} ===\n")
         except OSError:
             pass
-        tabs.add("概览")
-        tabs.add("配置")
-        try:
-            tabs.set(initial_tab)
-        except Exception:
-            pass
-        self._lazy_build_detail_tab()              # 只建初始激活的 tab
-        tabs.after_idle(lambda: tabs.set(initial_tab))
-        self._start_heartbeat()                    # 诊断：心跳，卡死即停
 
-    def _lazy_build_detail_tab(self):
-        """详情页外层 tab 懒加载：首次显示某 tab 才渲染其内容（再次切回不重建）。"""
-        tabs = self._detail_tabs
-        name = tabs.get()
-        if name in self._detail_tab_built:
-            return
-        self._detail_tab_built.add(name)
-        frame = tabs.tab(name)
+        bar = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        bar.pack(fill="x", padx=10, pady=(6, 0))
+        for name in ("概览", "配置"):
+            ctk.CTkButton(
+                bar, text=name, width=110, height=32,
+                fg_color="#2b719e" if name == active_tab else "#3a3a3a",
+                hover_color="#1f538d" if name == active_tab else "#4a4a4a",
+                command=lambda n=name: self.show_instance_detail(
+                    inst, initial_tab=n,
+                    active_sub=(self._detail_active_sub if n == "配置" else None)),
+            ).pack(side="left", padx=(0, 6))
+
+        content = ctk.CTkFrame(self.main_frame, fg_color="#1d1d1d", corner_radius=8)
+        content.pack(fill="both", expand=True, padx=10, pady=10)
         t0 = time.perf_counter()
-        if name == "概览":
-            self._render_overview_tab(frame, self._detail_inst)
-        elif name == "配置":
-            self._render_config_tab(frame, self._detail_inst,
-                                    active_sub=self._detail_active_sub)
-        try:
-            with open("/tmp/hmsl_render.log", "a") as _f:
-                _f.write(f"[外层tab] {name}  +{time.perf_counter()-t0:.3f}s\n")
-        except OSError:
-            pass
+        if active_tab == "概览":
+            self._render_overview_tab(content, inst)
+        else:
+            self._render_config_tab(content, inst, active_sub=active_sub)
+        _rlog(f"[详情] {active_tab}  build+{time.perf_counter()-t0:.3f}s")
+        self._start_heartbeat()                    # 诊断：心跳，卡死即停
 
     # --- Overview tab ---
 
@@ -1574,63 +1651,58 @@ class HMSLApp(*_APP_BASES):
     # --- Config tab (with 3 sub-tabs) ---
 
     def _render_config_tab(self, parent, inst, active_sub=None):
-        """配置中心：3 个 sub-tab —— server.properties / 世界 / 模组。
-        懒加载：点哪个子标签才构建哪个编辑器，避免一次性绘制
-        server.properties(~80控件)+世界+模组 在前台窗口冻死 UI。"""
-        sub = ctk.CTkTabview(parent, fg_color="#2a2a2a",
-                             command=self._lazy_build_config_subtab)
-        sub.pack(fill="both", expand=True, padx=4, pady=4)
-        self._cfg_subtabview = sub          # 供路由/测试激活某个子标签
+        """配置中心：3 个子页 —— server.properties / 世界 / 模组。
+
+        ⚠️ 不用嵌套 CTkTabview：详情页本身已是一个 CTkTabview，若在其 tab 内再套
+        一个 CTkTabview，macOS 上会触发"窗口停止重绘"——子页切换在后台完成、事件
+        照收，但画面定格，用户狂点无反应（2026-09-23 用点击记录器实锤）。
+        子页切换不在这层原地做，而是回到『详情层』整页重建（见 _show_config_subtab）。
+        这里只按传入的 active_sub 一次性把选中的那个子页直接画出来（不切换、不递归）。
+        """
         self._cfg_inst = inst
-        self._cfg_subtab_built = set()
         self._cfg_subtab_factories = {
             "🌐 server.properties": self._render_server_properties_subtab,
             "🌍 世界": self._render_world_config_subtab,
             "🔧 模组": self._render_mod_config_subtab,
         }
+        active = (active_sub if active_sub in self._cfg_subtab_factories
+                  else "🌐 server.properties")
+        _rlog(f"[配置页] 建按钮栏 + 直接渲染子页 {active}")
+        bar = ctk.CTkFrame(parent, fg_color="transparent")
+        bar.pack(fill="x", padx=4, pady=(4, 0))
         for name in self._cfg_subtab_factories:
-            sub.add(name)
-        try:
-            sub.set(active_sub or "🌐 server.properties")
-        except Exception:
-            pass
-        self._lazy_build_config_subtab()    # 只建当前激活的子编辑器
-
-    def _lazy_build_config_subtab(self):
-        """配置子标签懒加载：首次显示某子标签才构建其编辑器；带计时日志。
-        任一编辑器构造失败只在该子标签内显示错误，不冲断整页、不影响返回。"""
-        sub = self._cfg_subtabview
-        name = sub.get()
-        _rlog(f"→ 切到子标签 {name}")
-        if name in self._cfg_subtab_built:
-            _rlog(f"  ({name} 已建过，跳过)")
-            return
-        self._cfg_subtab_built.add(name)
-        factory = self._cfg_subtab_factories.get(name)
-        if factory is None:
-            return
-        tabframe = sub.tab(name)
+            ctk.CTkButton(
+                bar, text=name, width=155, height=30,
+                fg_color="#2b719e" if name == active else "#3a3a3a",
+                hover_color="#1f538d" if name == active else "#4a4a4a",
+                command=lambda n=name: self._show_config_subtab(n),
+            ).pack(side="left", padx=(0, 6))
+        content = ctk.CTkFrame(parent, fg_color="#2a2a2a", corner_radius=8)
+        content.pack(fill="both", expand=True, padx=4, pady=4)
+        holder = ctk.CTkFrame(content, fg_color="transparent")
+        holder.pack(fill="both", expand=True)
         t0 = time.perf_counter()
         try:
-            factory(tabframe, self._cfg_inst)
+            self._cfg_subtab_factories[active](holder, inst)
         except Exception as e:
             ctk.CTkLabel(
-                tabframe,
+                holder,
                 text=f"⚠️ 此配置加载失败：\n{type(e).__name__}: {e}\n\n"
-                     f"其它子标签和「← 返回列表」仍可正常使用。",
+                     f"其它子页和「← 返回列表」仍可正常使用。",
                 text_color="#e06c6c", justify="left",
                 font=ctk.CTkFont(size=12)).pack(padx=20, pady=20, anchor="w")
             traceback.print_exc()
-        tb = time.perf_counter()
-        _rlog(f"[配置子标签] {name}  build+{tb-t0:.3f}s  …开始draw")
-        try:
-            tabframe.update_idletasks()   # 强制立即绘制刚建的控件，隔离“绘制”耗时
-        except Exception:
-            pass
-        _rlog(f"[配置子标签] {name}  draw+{time.perf_counter()-tb:.3f}s  ✓完成")
+        _rlog(f"[配置子页] {active}  build+{time.perf_counter()-t0:.3f}s")
+
+    def _show_config_subtab(self, name):
+        """点配置子页按钮：整页重建详情页、配置 tab 激活到该子页（clear_main_frame 是
+        macOS 上唯一每次都可靠上屏的路径；原地/深层重建都不重绘）。"""
+        if name not in self._cfg_subtab_factories:
+            return
+        self.show_instance_detail(self._detail_inst, initial_tab="配置", active_sub=name)
 
     def _render_server_properties_subtab(self, parent, inst):
-        """server.properties 可视化编辑 + 未知 key 走 raw 文本框。"""
+        """server.properties 可视化编辑（分页）+ 未知 key 走 raw 文本框。"""
         editor = ServerPropertiesEditor(parent, inst["path"], self)
         editor.pack(fill="both", expand=True)
 
@@ -2023,6 +2095,88 @@ def _own_cg_window_id(app):
     return best_id
 
 
+def _arm_freeze_watchdog(app, out_path="/tmp/hmsl_freeze_stack.txt", stall_s=2.5):
+    """卡死看门狗：主循环每 0.5s 跳一次心跳；后台守护线程发现心跳停跳 >stall_s
+    秒，就把此刻所有线程的 Python 调用栈 dump 到 out_path（真前台窗口卡死也能抓）。
+    同一次卡死只 dump 一次；恢复后再卡会再 dump。仅诊断用，--freeze-watchdog 开启。"""
+    import threading
+    import faulthandler
+    import time as _t
+    import traceback as _tb
+
+    try:
+        with open(out_path, "w") as f:
+            f.write(f"=== freeze watchdog armed {_t.strftime('%H:%M:%S')} "
+                    f"(stall>{stall_s}s) ===\n")
+    except OSError:
+        pass
+
+    # (A) 全局点击记录器：每次左键，记下点中的控件类名+文字（不依赖主循环）。
+    def _log_click(e):
+        try:
+            w = e.widget
+            info = w.__class__.__name__
+            try:
+                t = w.cget("text")
+                if t:
+                    info += f" text={t!r}"
+            except Exception:
+                pass
+            _rlog(f"[CLICK] @({e.x_root},{e.y_root}) -> {info}")
+        except Exception as ex:
+            _rlog(f"[CLICK] 记录出错: {ex}")
+    try:
+        app.bind_all("<Button-1>", _log_click, add="+")
+    except Exception:
+        pass
+
+    # (B) 回调异常捕获器：Tk 回调里抛的异常默认只打 stderr、易被吞。这里落文件。
+    def _report_exc(exc, val, tbk):
+        try:
+            with open("/tmp/hmsl_exc.txt", "a") as f:
+                f.write(f"\n===== Tk 回调异常 {_t.strftime('%H:%M:%S')} =====\n")
+                _tb.print_exception(exc, val, tbk, file=f)
+        except Exception:
+            pass
+        try:
+            _tb.print_exception(exc, val, tbk)
+        except Exception:
+            pass
+    try:
+        app.report_callback_exception = _report_exc
+    except Exception:
+        pass
+
+    state = {"beat": 0, "dumped_at": -1}
+
+    def tick():
+        state["beat"] += 1
+        app.after(500, tick)
+    app.after(500, tick)
+
+    def watch():
+        last_beat, last_change = -1, _t.time()
+        while True:
+            _t.sleep(1.0)
+            b = state["beat"]
+            now = _t.time()
+            if b != last_beat:
+                last_beat, last_change = b, now
+                continue
+            if now - last_change >= stall_s and state["dumped_at"] != b:
+                state["dumped_at"] = b
+                try:
+                    with open(out_path, "a") as f:
+                        f.write(f"\n===== 卡死 (心跳停跳 {now-last_change:.1f}s) "
+                                f"@beat {b} {_t.strftime('%H:%M:%S')} =====\n")
+                        faulthandler.dump_traceback(file=f)
+                        f.write("===== end =====\n")
+                except Exception:
+                    pass
+
+    threading.Thread(target=watch, daemon=True, name="freeze-watchdog").start()
+
+
 def _widget_text(w) -> str:
     """尽力取控件的显示文字（CTk 存在 ._text，原生 tk 用 cget('text')）。"""
     try:
@@ -2182,9 +2336,16 @@ if __name__ == "__main__":
                         help="After --route, dump the widget tree + button wiring audit "
                              "to this PATH (text) and exit. Used by tools/dump.py. "
                              "No screenshot / no foreground activation needed.")
+    parser.add_argument("--freeze-watchdog", dest="freeze_watchdog",
+                        action="store_true",
+                        help="Arm a background watchdog that dumps the main-thread "
+                             "stack to /tmp/hmsl_freeze_stack.txt whenever the UI "
+                             "stalls >4s. For diagnosing real-foreground-window hangs.")
     args = parser.parse_args()
 
     app = HMSLApp()
+    if args.freeze_watchdog:
+        _arm_freeze_watchdog(app)
     if args.snap:
         # 截图模式：一启动就把窗口置顶，给 WM 充足时间把它浮到其它 App 之上。
         # screencapture -R 抓的是屏幕区域，HMSL 必须真在最前才拍得到；只在
