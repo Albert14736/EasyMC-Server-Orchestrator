@@ -13,14 +13,23 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import requests
 
 
 _MODRINTH_API = "https://api.modrinth.com"
 _USER_AGENT = "HMSL/0.1 (https://github.com/hmsl) mod-scanner"
+
+# Parallel lookups: each jar costs two small HTTP round trips, so a few
+# workers turn a 200-mod pack from minutes into seconds.
+_LOOKUP_WORKERS = 8
+# After this many network failures in one scan, stop hitting the network.
+_MAX_NET_ERRORS = 2
 
 
 @dataclass
@@ -68,40 +77,67 @@ def compute_jar_sha1(file_path: str, chunk_size: int = 65536) -> str:
     return h.hexdigest()
 
 
-def lookup_mod_by_sha1(sha1: str, timeout: float = 10.0) -> Optional[ModInfo]:
-    """
-    Hash → Modrinth version → Modrinth project metadata.
-    Returns None on 404, network error, or any unexpected response shape.
-    """
-    headers = {"User-Agent": _USER_AGENT}
+# ---------- Modrinth lookup ----------
+
+_tls = threading.local()
+_project_cache: Dict[str, dict] = {}
+_project_cache_lock = threading.Lock()
+
+
+def _session() -> requests.Session:
+    """One keep-alive session per thread (requests.Session isn't thread-safe)."""
+    s = getattr(_tls, "session", None)
+    if s is None:
+        s = requests.Session()
+        s.headers["User-Agent"] = _USER_AGENT
+        _tls.session = s
+    return s
+
+
+def _lookup_sha1(sha1: str, timeout: float = 10.0) -> Tuple[Optional[ModInfo], bool]:
+    """Returns (info, network_error). info is None on 404 / network error / bad shape."""
+    s = _session()
     try:
-        r = requests.get(
+        r = s.get(
             f"{_MODRINTH_API}/v2/version_file/{sha1}",
-            params={"algorithm": "sha1"},
-            headers=headers, timeout=timeout,
+            params={"algorithm": "sha1"}, timeout=timeout,
         )
         if r.status_code == 404:
-            return None
+            return None, False
         r.raise_for_status()
         version = r.json()
-        project_id = version.get("project_id")
+        project_id = version.get("project_id") if isinstance(version, dict) else None
         if not project_id:
-            return None
+            return None, False
 
-        r = requests.get(
-            f"{_MODRINTH_API}/v2/project/{project_id}",
-            headers=headers, timeout=timeout,
-        )
-        r.raise_for_status()
-        project = r.json()
+        with _project_cache_lock:
+            project = _project_cache.get(project_id)
+        if project is None:
+            r = s.get(f"{_MODRINTH_API}/v2/project/{project_id}", timeout=timeout)
+            r.raise_for_status()
+            project = r.json()
+            if not isinstance(project, dict):
+                return None, False
+            with _project_cache_lock:
+                _project_cache[project_id] = project
         return ModInfo(
             project_id=project_id,
             project_title=project.get("title", project_id),
             client_side=project.get("client_side", "unknown"),
             server_side=project.get("server_side", "unknown"),
-        )
+        ), False
+    except (requests.ConnectionError, requests.Timeout):
+        return None, True
     except (requests.RequestException, ValueError):
-        return None
+        return None, False
+
+
+def lookup_mod_by_sha1(sha1: str, timeout: float = 10.0) -> Optional[ModInfo]:
+    """
+    Hash → Modrinth version → Modrinth project metadata.
+    Returns None on 404, network error, or any unexpected response shape.
+    """
+    return _lookup_sha1(sha1, timeout)[0]
 
 
 def classify_mod(info: Optional[ModInfo]) -> str:
@@ -139,10 +175,15 @@ def scan_server_mods(
     server_path: str,
     progress_callback: Optional[ProgressCallback] = None,
     lookup_fn: Callable[[str], Optional[ModInfo]] = lookup_mod_by_sha1,
+    max_workers: int = _LOOKUP_WORKERS,
 ) -> ScanReport:
     """
     Walk `server_path/{mods,plugins}/*.jar`, hash each, classify via Modrinth.
     `lookup_fn` is injectable so tests can avoid network entirely.
+
+    Jars are hashed + looked up on a small thread pool; entries keep the
+    sorted-by-name order, and progress_callback is called from THIS thread
+    with current = 1..total as jars finish.
     """
     mods_dir = find_mods_dir(server_path)
     if not mods_dir:
@@ -157,47 +198,126 @@ def scan_server_mods(
     except OSError:
         return ScanReport(server_path=server_path, mods_dir=mods_dir)
 
-    entries: List[ScanEntry] = []
-    total = len(jar_names)
-    for i, name in enumerate(jar_names, start=1):
+    # Default lookup: stop hitting the network once it's clearly down, so an
+    # offline scan doesn't pay a connect timeout for every jar.
+    net_errors = [0]
+    net_lock = threading.Lock()
+    if lookup_fn is lookup_mod_by_sha1:
+        def lookup(sha1: str) -> Optional[ModInfo]:
+            with net_lock:
+                if net_errors[0] >= _MAX_NET_ERRORS:
+                    return None
+            info, net_err = _lookup_sha1(sha1)
+            if net_err:
+                with net_lock:
+                    net_errors[0] += 1
+            return info
+    else:
+        lookup = lookup_fn
+
+    def work(name: str) -> ScanEntry:
         path = os.path.join(mods_dir, name)
-        if progress_callback:
-            progress_callback(i, total, name)
         try:
             sha1 = compute_jar_sha1(path)
         except OSError as e:
-            entries.append(ScanEntry(path, name, status="error", error_message=str(e)))
-            continue
-        info = lookup_fn(sha1)
-        entries.append(ScanEntry(path, name, status=classify_mod(info), mod_info=info))
+            return ScanEntry(path, name, status="error", error_message=str(e))
+        try:
+            info = lookup(sha1)
+        except Exception:  # an injected lookup shouldn't kill the whole scan
+            info = None
+        return ScanEntry(path, name, status=classify_mod(info), mod_info=info)
 
+    total = len(jar_names)
+    results: List[Optional[ScanEntry]] = [None] * total
+    if total:
+        workers = max(1, min(max_workers, total))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="hmsl-modscan") as pool:
+            futures = {pool.submit(work, name): i for i, name in enumerate(jar_names)}
+            done = 0
+            for fut in as_completed(futures):
+                i = futures[fut]
+                try:
+                    results[i] = fut.result()
+                except Exception as e:
+                    name = jar_names[i]
+                    results[i] = ScanEntry(os.path.join(mods_dir, name), name,
+                                           status="error", error_message=str(e))
+                done += 1
+                if progress_callback:
+                    progress_callback(done, total, jar_names[i])
+
+    entries = [e for e in results if e is not None]
     return ScanReport(server_path=server_path, mods_dir=mods_dir, entries=entries)
 
 
-def disable_mods(entries: List[ScanEntry], mods_dir: str) -> int:
+# ---------- disabling ----------
+
+def _fs(p: str) -> str:
+    """Windows: add the \\\\?\\ prefix to long paths so rename/makedirs work
+    past MAX_PATH even when LongPathsEnabled is off. No-op elsewhere."""
+    if sys.platform != "win32":
+        return p
+    p = os.path.abspath(p)
+    if len(p) < 240 or p.startswith("\\\\?\\"):
+        return p
+    if p.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + p[2:]
+    return "\\\\?\\" + p
+
+
+def _describe_move_error(e: OSError) -> str:
+    winerr = getattr(e, "winerror", None)
+    if isinstance(e, PermissionError) or winerr in (5, 32, 33):
+        if sys.platform == "win32":
+            return "文件被占用，无法移动（服务器可能正在运行——Windows 会锁定已加载的模组 jar，请先停止服务器再禁用）"
+        return f"没有权限移动该文件：{e.strerror or e}"
+    if isinstance(e, FileNotFoundError):
+        return "文件不存在或路径过长，无法移动"
+    return f"移动失败：{e.strerror or e}"
+
+
+def disable_mods_detailed(entries: List[ScanEntry], mods_dir: str) -> Tuple[int, List[Tuple[str, str]]]:
     """
     Move each entry's jar to `mods_dir/.disabled/` (created on demand).
     On filename collision, appends _1, _2, ... so the original disabled file
-    is never overwritten. Returns the count of files successfully moved.
+    is never overwritten.
+
+    Returns (moved_count, [(file_name, error_message), ...]) — every entry that
+    was not moved is listed with a Chinese reason (locked by a running server,
+    missing, path too long, ...).
 
     This is intentionally REVERSIBLE — user can restore by moving back.
     """
+    failed: List[Tuple[str, str]] = []
     disabled_dir = os.path.join(mods_dir, ".disabled")
-    os.makedirs(disabled_dir, exist_ok=True)
+    try:
+        os.makedirs(_fs(disabled_dir), exist_ok=True)
+    except OSError as e:
+        msg = f"无法创建 .disabled 目录：{e.strerror or e}"
+        return 0, [(entry.file_name, msg) for entry in entries]
 
     moved = 0
     for entry in entries:
-        if not os.path.isfile(entry.file_path):
+        if not os.path.isfile(_fs(entry.file_path)):
+            failed.append((entry.file_name, "文件不存在（可能已被移动或删除）"))
             continue
         target = os.path.join(disabled_dir, entry.file_name)
         suffix = 1
-        while os.path.exists(target):
+        while os.path.exists(_fs(target)):
             base, ext = os.path.splitext(entry.file_name)
             target = os.path.join(disabled_dir, f"{base}_{suffix}{ext}")
             suffix += 1
         try:
-            os.rename(entry.file_path, target)
+            os.rename(_fs(entry.file_path), _fs(target))
             moved += 1
-        except OSError:
-            continue
-    return moved
+        except OSError as e:
+            failed.append((entry.file_name, _describe_move_error(e)))
+    return moved, failed
+
+
+def disable_mods(entries: List[ScanEntry], mods_dir: str) -> int:
+    """
+    Same as disable_mods_detailed but only returns the count of files
+    successfully moved (kept for existing callers).
+    """
+    return disable_mods_detailed(entries, mods_dir)[0]

@@ -15,15 +15,11 @@ URL is set by the pack author and points at their own CDN.
 """
 from __future__ import annotations
 
-import hashlib
-import json
-import os
+import urllib.parse
 import zipfile
 from typing import Callable, List, Optional, Tuple
 
 import requests
-
-from core.server_factory import CreateServerResult, create_server
 
 from .base import (
     ImportProgress,
@@ -31,8 +27,17 @@ from .base import (
     ModpackFile,
     ModpackManifest,
     ModpackProvider,
+    archive_fingerprint,
+    create_server_for_pack,
+    find_zip_entry,
+    open_zip,
+    read_zip_json,
+    safe_target,
+    summarize_problems,
+    without_launch_files,
+    write_error_reason,
 )
-from .modrinth import _extract_overrides
+from .modrinth import _ModrinthSides, _download_to, _extract_overrides
 
 _USER_AGENT = "HMSL/0.1 modpack-importer (hmcl-server)"
 _MANIFEST = "server-manifest.json"
@@ -48,6 +53,9 @@ _ADDON_LOADER_MAP = {
 # use "game". Accept both.
 _ADDON_MINECRAFT_IDS = {"minecraft", "game"}
 
+_QUILT_WARNING = ("该整合包使用 Quilt 加载器，HMSL 会用 Fabric 服务端运行它；"
+                  "只支持 Quilt 的模组可能无法加载。")
+
 
 class HMCLServerProvider(ModpackProvider):
     name = "hmcl_server"
@@ -57,22 +65,25 @@ class HMCLServerProvider(ModpackProvider):
             return False
         try:
             with zipfile.ZipFile(archive_path) as zf:
-                return _MANIFEST in zf.namelist()
+                return find_zip_entry(zf, _MANIFEST) is not None
         except (zipfile.BadZipFile, OSError):
             return False
 
     def parse(self, archive_path: str) -> ModpackManifest:
-        with zipfile.ZipFile(archive_path) as zf:
-            try:
-                data = json.loads(zf.read(_MANIFEST).decode("utf-8"))
-            except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as e:
-                raise ValueError(f"无法解析 {_MANIFEST}: {e}") from e
+        with open_zip(archive_path) as zf:
+            data = read_zip_json(zf, _MANIFEST)
 
-        mc_version, loader, loader_version = _addons_to_loader(data.get("addons", []))
-        file_api = (data.get("fileApi") or "").rstrip("/")
+        mc_version, loader, loader_version, is_quilt = _addons_to_loader(data.get("addons", []))
+        warnings: List[str] = []
+        if is_quilt:
+            loader_version = None
+            warnings.append(_QUILT_WARNING)
+        file_api = data.get("fileApi")
+        file_api = file_api.strip().rstrip("/") if isinstance(file_api, str) else ""
 
         files: List[ModpackFile] = []
-        for f in data.get("files", []) or []:
+        raw_files = data.get("files")
+        for f in raw_files if isinstance(raw_files, list) else []:
             if not isinstance(f, dict):
                 continue
             path = f.get("path")
@@ -81,10 +92,10 @@ class HMCLServerProvider(ModpackProvider):
                 continue
             urls: List[str] = []
             if file_api:
-                urls.append(f"{file_api}/{path}")
+                urls.append(_file_api_url(file_api, path))
             files.append(ModpackFile(
                 path=path,
-                sha1=sha1 if isinstance(sha1, str) else None,
+                sha1=sha1 if isinstance(sha1, str) and sha1 else None,
                 download_urls=urls,
             ))
 
@@ -97,6 +108,8 @@ class HMCLServerProvider(ModpackProvider):
             loader_version=loader_version,
             summary=str(data.get("description", data.get("author", ""))),
             files=files,
+            warnings=warnings,
+            source=archive_fingerprint(archive_path),
         )
 
     def apply(
@@ -108,6 +121,8 @@ class HMCLServerProvider(ModpackProvider):
         installer,
         downloader,
         progress_callback: Optional[Callable[[ImportProgress], None]] = None,
+        *,
+        manifest: Optional[ModpackManifest] = None,
     ) -> ImportResult:
         def report(stage, msg, current=0, total=0):
             if progress_callback:
@@ -116,91 +131,109 @@ class HMCLServerProvider(ModpackProvider):
 
         report("parsing", "正在读取 server-manifest.json…")
         try:
-            manifest = self.parse(archive_path)
+            manifest = self.prepared_manifest(archive_path, manifest)
         except ValueError as e:
             return ImportResult(False, "", str(e))
+        warnings: List[str] = list(manifest.warnings)
 
         report("creating_server", f"正在创建 {manifest.loader} {manifest.mc_version} 服务端…")
-        cr: CreateServerResult = create_server(
-            name=server_name, version=manifest.mc_version,
-            loader=manifest.loader, parent_dir=parent_dir,
-            env_manager=env_manager, installer=installer, downloader=downloader,
-        )
+        cr = create_server_for_pack(manifest, server_name, parent_dir, env_manager,
+                                    installer, downloader, warnings, report)
         if not cr.success:
             return ImportResult(False, cr.server_path or "",
-                                f"创建服务端失败：{cr.error}", manifest=manifest)
+                                f"创建服务端失败：{cr.error}", manifest=manifest,
+                                warnings=warnings)
         server_path = cr.server_path
 
-        installed = failed = 0
+        installed = 0
+        problems: List[Tuple[str, str]] = []
+        files = without_launch_files(manifest.files, warnings)   # never over HMSL's start script
         report("downloading_files",
-               f"开始下载 {len(manifest.files)} 个文件…",
-               current=0, total=len(manifest.files))
-        for i, f in enumerate(manifest.files, start=1):
-            report("downloading_files", f.path, current=i, total=len(manifest.files))
+               f"开始下载 {len(files)} 个文件…",
+               current=0, total=len(files))
+        for i, f in enumerate(files, start=1):
+            report("downloading_files", f.path, current=i, total=len(files))
             if not f.download_urls:
-                failed += 1
+                problems.append((f.path, "整合包没有提供下载地址 (fileApi)"))
                 continue
-            if _download_and_verify(f.download_urls[0], server_path, f.path, f.sha1):
+            reason = _download_and_verify_reason(f.download_urls[0], server_path, f.path, f.sha1)
+            if reason is None:
                 installed += 1
             else:
-                failed += 1
+                problems.append((f.path, reason))
+        if problems:
+            warnings.append(summarize_problems(
+                f"{len(problems)} 个文件下载失败，可稍后手动放进服务器目录", problems))
 
         report("applying_overrides", "正在解压 overrides…")
-        _extracted, ov_installed, ov_skipped = _extract_overrides(
-            archive_path, server_path, "overrides/")
-        installed += ov_installed
+        sides = _ModrinthSides()
+        st = _extract_overrides(archive_path, server_path, "overrides/", warnings=warnings,
+                                progress_callback=progress_callback, sides=sides)
+        installed += st.mods_installed
+        if sides.offline:
+            warnings.append("无法连接 Modrinth，未能检查整合包自带的模组是否为纯客户端模组；"
+                            "如果服务器启动报错，可在「模组扫描」里再检查一次。")
 
         report("done", "整合包导入完成")
         return ImportResult(
-            success=(failed == 0),
+            success=True,
             server_path=server_path,
-            error=None if failed == 0 else f"{failed} 个文件下载失败",
+            error=None,
             manifest=manifest,
             files_installed=installed,
-            files_skipped_client=ov_skipped,
-            files_failed=failed,
+            files_skipped_client=st.mods_skipped + st.client_skipped,
+            files_failed=len(problems) + st.failed,
+            warnings=warnings,
         )
 
 
 # ---------- helpers ----------
 
-def _addons_to_loader(addons: list) -> Tuple[str, str, Optional[str]]:
-    mc_version = ""; loader = "Paper"; loader_version = None
+def _file_api_url(file_api: str, path: str) -> str:
+    """{fileApi}/{path} with the path percent-encoded ('#', '?', '%', spaces, 中文 …)."""
+    rel = path.replace("\\", "/").lstrip("/")
+    return f"{file_api}/{urllib.parse.quote(rel, safe='/')}"
+
+
+def _addons_to_loader(addons: list) -> Tuple[str, str, Optional[str], bool]:
+    """addons[] → (mc_version, loader, loader_version, is_quilt)."""
+    mc_version = ""; loader = "Paper"; loader_version = None; is_quilt = False
     if not isinstance(addons, list):
-        return mc_version, loader, loader_version
+        return mc_version, loader, loader_version, is_quilt
     for a in addons:
         if not isinstance(a, dict): continue
-        aid = a.get("id", ""); ver = a.get("version", "")
+        aid = str(a.get("id", "") or "").lower(); ver = a.get("version", "")
         if aid in _ADDON_MINECRAFT_IDS:
-            mc_version = str(ver)
+            mc_version = str(ver or "")
         elif aid in _ADDON_LOADER_MAP:
             loader = _ADDON_LOADER_MAP[aid]
             loader_version = str(ver) if ver else None
-    return mc_version, loader, loader_version
+            is_quilt = aid == "quilt"
+    return mc_version, loader, loader_version, is_quilt
+
+
+def _download_and_verify_reason(url: str, server_root: str, rel_path: str,
+                                expected_sha1: Optional[str]) -> Optional[str]:
+    """
+    Stream-download to server_root/rel_path, sha1-verify if hash known.
+    Returns None on success, else a short Chinese reason. Goes through a temp
+    file, so a failed download never deletes a file that was already there.
+    """
+    target, reason = safe_target(server_root, rel_path)
+    if target is None:
+        return reason
+    try:
+        _download_to(url, target, _USER_AGENT, {"sha1": expected_sha1})
+        return None
+    except requests.RequestException as e:   # (subclass of OSError — keep first)
+        return f"下载失败：{e}"
+    except OSError as e:
+        return write_error_reason(target, e)
+    except Exception as e:                   # hash mismatch
+        return str(e)
 
 
 def _download_and_verify(url: str, server_root: str, rel_path: str,
                           expected_sha1: Optional[str]) -> bool:
     """Stream-download to server_root/rel_path, sha1-verify if hash known."""
-    target = os.path.abspath(os.path.join(server_root, rel_path))
-    if not target.startswith(os.path.abspath(server_root) + os.sep):
-        return False  # zip-slip defense
-    os.makedirs(os.path.dirname(target), exist_ok=True)
-    try:
-        r = requests.get(url, stream=True,
-                         headers={"User-Agent": _USER_AGENT}, timeout=60)
-        r.raise_for_status()
-        h = hashlib.sha1()
-        with open(target, "wb") as out:
-            for chunk in r.iter_content(chunk_size=65536):
-                out.write(chunk)
-                h.update(chunk)
-        if expected_sha1 and h.hexdigest().lower() != expected_sha1.lower():
-            try: os.remove(target)
-            except OSError: pass
-            return False
-        return True
-    except (requests.RequestException, OSError):
-        try: os.remove(target)
-        except OSError: pass
-        return False
+    return _download_and_verify_reason(url, server_root, rel_path, expected_sha1) is None
