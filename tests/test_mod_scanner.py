@@ -133,7 +133,13 @@ def test_scan_server_mods_reports_progress(tmp_path):
         progress_callback=lambda i, n, name: progress_calls.append((i, n, name)),
         lookup_fn=lambda s: None,
     )
-    assert progress_calls == [(1, 3, "a.jar"), (2, 3, "b.jar"), (3, 3, "c.jar")]
+    # Scanning is concurrent (ThreadPoolExecutor + as_completed), so the completion
+    # ORDER is nondeterministic — assert the invariants instead of a fixed sequence:
+    # one call per jar, total always 3, the counter runs 1..3, and every jar reported.
+    assert len(progress_calls) == 3
+    assert all(n == 3 for _i, n, _name in progress_calls)
+    assert sorted(i for i, _n, _name in progress_calls) == [1, 2, 3]
+    assert {name for _i, _n, name in progress_calls} == {"a.jar", "b.jar", "c.jar"}
 
 
 def test_scan_server_mods_skips_non_jar_files(tmp_path):

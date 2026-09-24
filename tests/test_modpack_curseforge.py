@@ -52,6 +52,13 @@ class FakeResp:
         self.content = content
         self.status_code = status_code
 
+    # the downloader now streams inside `with requests.get(...) as r:`
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
     def raise_for_status(self):
         if self.status_code >= 400:
             raise __import__("requests").HTTPError(f"status {self.status_code}")
@@ -88,6 +95,18 @@ def _write_cf_zip(tmp_path, name, manifest_dict, extra_files=None):
         for arc_path, payload in (extra_files or {}).items():
             zf.writestr(arc_path, payload)
     return str(p)
+
+
+def _mock_modrinth_sides(monkeypatch, sha1_table=None):
+    """Client-only classification now goes through the batched _ModrinthSides
+    lookups (sha1 -> ModInfo). Replace them so imports never touch the network.
+    sha1_table: {sha1_hex: ModInfo}; anything not listed resolves to None."""
+    table = {k.lower(): v for k, v in (sha1_table or {}).items()}
+    monkeypatch.setattr(cf_mod._ModrinthSides, "by_sha1",
+                        lambda self, sha1s: {s.lower(): table[s.lower()]
+                                             for s in sha1s
+                                             if isinstance(s, str) and s.lower() in table})
+    monkeypatch.setattr(cf_mod._ModrinthSides, "by_slugs", lambda self, slugs: {})
 
 
 # ---------- detect ----------
@@ -145,32 +164,36 @@ def test_parse_extracts_name_version_loader(tmp_path):
     assert len(m.files) == 1
 
 
-@pytest.mark.parametrize("loader_id,expected_name,expected_ver", [
-    ("forge-14.23.5.2860",      "Forge",    "14.23.5.2860"),
-    ("neoforge-20.4.190",       "NeoForge", "20.4.190"),
-    ("fabric-loader-0.15.6",    "Fabric",   "loader-0.15.6"),  # matches fabric- prefix
-    ("fabric-0.14.21",          "Fabric",   "0.14.21"),
-    ("quilt-loader-0.21.0",     "Fabric",   "loader-0.21.0"),  # Quilt mapped to Fabric
+# _pick_loader now returns (loader, version, is_quilt) — is_quilt is True only for
+# quilt-* ids (Quilt is server-compat with Fabric, so the loader label is "Fabric").
+@pytest.mark.parametrize("loader_id,expected_name,expected_ver,expected_quilt", [
+    ("forge-14.23.5.2860",      "Forge",    "14.23.5.2860", False),
+    ("neoforge-20.4.190",       "NeoForge", "20.4.190",     False),
+    ("fabric-loader-0.15.6",    "Fabric",   "loader-0.15.6", False),  # matches fabric- prefix
+    ("fabric-0.14.21",          "Fabric",   "0.14.21",      False),
+    ("quilt-loader-0.21.0",     "Fabric",   "loader-0.21.0", True),   # Quilt mapped to Fabric
 ])
-def test_loader_prefix_mapping(loader_id, expected_name, expected_ver):
-    name, ver = _pick_loader([{"id": loader_id, "primary": True}])
+def test_loader_prefix_mapping(loader_id, expected_name, expected_ver, expected_quilt):
+    name, ver, is_quilt = _pick_loader([{"id": loader_id, "primary": True}])
     assert name == expected_name
     assert ver == expected_ver
+    assert is_quilt == expected_quilt
 
 
 def test_pick_loader_falls_back_to_paper_for_unknown():
-    name, ver = _pick_loader([{"id": "bukkit-1.0", "primary": True}])
+    name, ver, is_quilt = _pick_loader([{"id": "bukkit-1.0", "primary": True}])
     assert name == "Paper"
     assert ver is None
+    assert is_quilt is False
 
 
 def test_pick_loader_handles_empty_list():
-    assert _pick_loader([]) == ("Paper", None)
+    assert _pick_loader([]) == ("Paper", None, False)
 
 
 def test_pick_loader_prefers_primary_true():
     """If multiple loaders given, primary=True wins."""
-    name, _v = _pick_loader([
+    name, _v, _q = _pick_loader([
         {"id": "fabric-0.14.21", "primary": False},
         {"id": "forge-47.2.0", "primary": True},
     ])
@@ -201,7 +224,9 @@ def test_parse_raises_on_missing_manifest(tmp_path):
 # ---------- apply (end-to-end mocked) ----------
 
 def test_apply_without_key_still_extracts_overrides(tmp_path, monkeypatch):
-    """No CF API key: files[] all fail, but overrides/ extracts normally."""
+    """No CF API key: files[] all fail, but overrides/ extract normally and the
+    import still SUCCEEDS — a missing key is a warning now, not a hard error
+    (import_modpack never fails just because some files couldn't download)."""
     monkeypatch.setattr(cf_mod, "get_curseforge_api_key", lambda: None)
     pack = _write_cf_zip(tmp_path, "p.zip", _make_manifest(
         files=[{"projectID": 1, "fileID": 100, "required": True}]),
@@ -213,13 +238,13 @@ def test_apply_without_key_still_extracts_overrides(tmp_path, monkeypatch):
         env_manager=FakeEnv(), installer=FakeInstaller(), downloader=FakeDownloader(),
     )
 
-    assert not result.success
-    assert result.files_failed == 1   # CF file couldn't download
-    assert result.files_installed >= 0  # overrides do go in
+    assert result.success               # partial failure -> warning, not a hard error
+    assert result.files_failed == 1     # CF file couldn't download (no key)
     server = tmp_path / "srv"
     assert (server / "config" / "test.cfg").read_bytes() == b"hello"
     assert (server / "scripts" / "x.zs").exists()
-    assert "curseforge_api_key" in result.error
+    # the missing-key explanation is surfaced as a warning
+    assert any("curseforge_api_key" in w for w in result.warnings)
 
 
 def test_apply_with_key_downloads_and_classifies(tmp_path, monkeypatch):
@@ -267,15 +292,13 @@ def test_apply_with_key_downloads_and_classifies(tmp_path, monkeypatch):
     monkeypatch.setattr(cf_mod, "_cf_batch_get_mods",
                         lambda ids, key, timeout=15.0: fake_mods)
 
-    # sha1 lookup: client_sha1 → client-only mod info, server_sha1 → server-ok
+    # Modrinth side-compat is a batched lookup now (_ModrinthSides.by_sha1):
+    # client_sha1 → client-only, server_sha1 → server-ok.
     from core.mod_scanner import ModInfo
-    def fake_sha1_lookup(sha1, timeout=10.0):
-        if sha1 == client_sha1:
-            return ModInfo("iris", "Iris", client_side="required", server_side="unsupported")
-        if sha1 == server_sha1:
-            return ModInfo("lithium", "Lithium", client_side="optional", server_side="required")
-        return None
-    monkeypatch.setattr(cf_mod, "lookup_mod_by_sha1", fake_sha1_lookup)
+    _mock_modrinth_sides(monkeypatch, {
+        client_sha1: ModInfo("iris", "Iris", client_side="required", server_side="unsupported"),
+        server_sha1: ModInfo("lithium", "Lithium", client_side="optional", server_side="required"),
+    })
 
     # Mock the actual file download (accept both stream-positional and
     # keyword-only calls — Modrinth slug fallback uses different signature).
@@ -334,19 +357,21 @@ def test_install_falls_back_to_forgecdn_when_opted_out(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cf_mod, "get_curseforge_api_key", lambda: "fake-key")
 
+    cdn_payload = b"FAKE_BYPASSED_JAR_CONTENTS"
+    cdn_sha1 = hashlib.sha1(cdn_payload).hexdigest()  # the new downloader verifies CF hashes
+
     monkeypatch.setattr(cf_mod, "_cf_batch_get_files", lambda ids, key, timeout=15.0: {
         5441212: {"id": 5441212, "fileName": "architecturecraft-3.109.jar",
                   "downloadUrl": None,  # opted out
-                  "hashes": [{"algo": 1, "value": "ff" * 20}]},
+                  "hashes": [{"algo": 1, "value": cdn_sha1}]},
     })
     monkeypatch.setattr(cf_mod, "_cf_batch_get_mods", lambda ids, key, timeout=15.0: {
         99: {"id": 99, "name": "ArchitectureCraft Spocel",
              "slug": "architecturecraft-spocel-version", "classId": 6},
     })
-    # Modrinth sha1 lookup returns None (not on Modrinth)
-    monkeypatch.setattr(cf_mod, "lookup_mod_by_sha1", lambda sha1, timeout=10.0: None)
+    # Not on Modrinth -> compat lookup resolves to None (server-compatible)
+    _mock_modrinth_sides(monkeypatch)
 
-    cdn_payload = b"FAKE_BYPASSED_JAR_CONTENTS"
     fetched_urls = []
     def fake_get(url, *args, **kwargs):
         fetched_urls.append(url)
@@ -388,7 +413,7 @@ def test_install_does_not_record_bypass_when_official_url_works(tmp_path, monkey
     monkeypatch.setattr(cf_mod, "_cf_batch_get_mods", lambda ids, key, timeout=15.0: {
         1: {"id": 1, "name": "Normal Mod", "slug": "normal", "classId": 6},
     })
-    monkeypatch.setattr(cf_mod, "lookup_mod_by_sha1", lambda sha1, timeout=10.0: None)
+    _mock_modrinth_sides(monkeypatch)
     monkeypatch.setattr(cf_mod.requests, "get",
                         lambda url, *a, **k: FakeResp(content=b"normal"))
 
@@ -413,7 +438,7 @@ def test_install_fails_when_both_official_and_cdn_fail(tmp_path, monkeypatch):
     monkeypatch.setattr(cf_mod, "_cf_batch_get_mods", lambda ids, key, timeout=15.0: {
         7: {"id": 7, "name": "Ghost", "slug": "ghost", "classId": 6},
     })
-    monkeypatch.setattr(cf_mod, "lookup_mod_by_sha1", lambda sha1, timeout=10.0: None)
+    _mock_modrinth_sides(monkeypatch)
     monkeypatch.setattr(cf_mod.requests, "get",
                         lambda url, *a, **k: FakeResp(status_code=404))
 

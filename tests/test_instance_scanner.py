@@ -51,10 +51,13 @@ def test_forge_1_12_2(tmp_path):
 
 
 def test_neoforge_from_libraries(tmp_path):
+    """NeoForge signal is the versioned subdir libraries/net/neoforged/neoforge/<build>
+    (a bare net/neoforged is not enough — the build folder also gives the MC version)."""
     d = tmp_path / "neo"; d.mkdir()
-    _mkdirs(str(d), "libraries", "net", "neoforged")
-    loader, _ = detect_loader_and_version(str(d))
+    _mkdirs(str(d), "libraries", "net", "neoforged", "neoforge", "21.1.77")
+    loader, version = detect_loader_and_version(str(d))
     assert loader == "NeoForge"
+    assert version == "1.21.1"
 
 
 def test_fabric_from_launch_jar(tmp_path):
@@ -65,10 +68,24 @@ def test_fabric_from_launch_jar(tmp_path):
 
 
 def test_fabric_from_libraries(tmp_path):
+    """Only libraries/net/fabricmc/fabric-loader marks Fabric — a bare net/fabricmc
+    (Paper ships net/fabricmc/mapping-io too) must NOT be read as Fabric.
+    The MC version comes from net/fabricmc/intermediary/<mc>."""
     d = tmp_path / "fab2"; d.mkdir()
-    _mkdirs(str(d), "libraries", "net", "fabricmc")
-    loader, _ = detect_loader_and_version(str(d))
+    _mkdirs(str(d), "libraries", "net", "fabricmc", "fabric-loader", "0.15.11")
+    _mkdirs(str(d), "libraries", "net", "fabricmc", "intermediary", "1.20.1")
+    loader, version = detect_loader_and_version(str(d))
     assert loader == "Fabric"
+    assert version == "1.20.1"
+
+
+def test_bare_fabricmc_mapping_io_is_not_fabric(tmp_path):
+    """Regression: a Paper dir carries libraries/net/fabricmc/mapping-io — that alone
+    must not be detected as Fabric."""
+    d = tmp_path / "paperish"; d.mkdir()
+    _mkdirs(str(d), "libraries", "net", "fabricmc", "mapping-io", "0.6.1")
+    loader, _ = detect_loader_and_version(str(d))
+    assert loader != "Fabric"
 
 
 def test_paper_from_version_history(tmp_path):

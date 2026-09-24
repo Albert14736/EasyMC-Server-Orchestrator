@@ -100,23 +100,26 @@ def test_multimc_parse_extracts_loader_from_uid(tmp_path):
     assert m.loader_version == "47.2.0"
 
 
-@pytest.mark.parametrize("uid,expected", [
-    ("net.minecraftforge",         "Forge"),
-    ("net.neoforged",              "NeoForge"),
-    ("net.fabricmc.fabric-loader", "Fabric"),
-    ("org.quiltmc.quilt-loader",   "Fabric"),
+# _components_to_loader now returns (mc_version, loader, loader_version, is_quilt)
+@pytest.mark.parametrize("uid,expected,expected_quilt", [
+    ("net.minecraftforge",         "Forge",    False),
+    ("net.neoforged",              "NeoForge", False),
+    ("net.fabricmc.fabric-loader", "Fabric",   False),
+    ("org.quiltmc.quilt-loader",   "Fabric",   True),
 ])
-def test_multimc_uid_mapping(uid, expected):
-    mc, loader, _ver = _components_to_loader([
+def test_multimc_uid_mapping(uid, expected, expected_quilt):
+    mc, loader, _ver, is_quilt = _components_to_loader([
         {"uid": "net.minecraft", "version": "1.20.1"},
         {"uid": uid, "version": "1.0"},
     ])
     assert loader == expected
+    assert is_quilt == expected_quilt
 
 
 def test_multimc_components_to_loader_handles_vanilla_only():
-    mc, loader, _ver = _components_to_loader([{"uid": "net.minecraft", "version": "1.20.1"}])
+    mc, loader, _ver, is_quilt = _components_to_loader([{"uid": "net.minecraft", "version": "1.20.1"}])
     assert mc == "1.20.1" and loader == "Paper"
+    assert is_quilt is False
 
 
 def test_multimc_apply_extracts_minecraft_contents(tmp_path):
@@ -234,10 +237,12 @@ def test_hmcl_server_apply_downloads_and_verifies(tmp_path, monkeypatch):
         {"path": "mods/sample.jar", "hash": sha1},
     ])
 
-    # Stub the file download
+    # Stub the file download (the shared downloader streams inside `with requests.get(...)`)
     from core.modpack import hmcl_server as hs
     class FakeResp:
         def __init__(self, content): self.content = content; self.status_code = 200
+        def __enter__(self): return self
+        def __exit__(self, *exc): return False
         def raise_for_status(self): pass
         def iter_content(self, chunk_size=65536):
             for i in range(0, len(self.content), chunk_size):
@@ -262,6 +267,8 @@ def test_hmcl_server_apply_rejects_sha1_mismatch(tmp_path, monkeypatch):
     from core.modpack import hmcl_server as hs
     class FakeResp:
         content = b"TAMPERED"; status_code = 200
+        def __enter__(self): return self
+        def __exit__(self, *exc): return False
         def raise_for_status(self): pass
         def iter_content(self, chunk_size=65536): yield self.content
     monkeypatch.setattr(hs.requests, "get", lambda *a, **k: FakeResp())
@@ -270,9 +277,11 @@ def test_hmcl_server_apply_rejects_sha1_mismatch(tmp_path, monkeypatch):
         archive_path=p, server_name="srv", parent_dir=str(tmp_path),
         env_manager=FakeEnv(), installer=FakeInstaller(), downloader=FakeDownloader(),
     )
-    assert not result.success
+    # The import still succeeds (server created, overrides applied); the tampered
+    # file is counted as failed and surfaced in warnings, not a hard error.
+    assert result.success
     assert result.files_failed == 1
-    # Bad file removed
+    # Bad file removed (hash mismatch discards the partial download)
     assert not (tmp_path / "srv" / "mods" / "x.jar").exists()
 
 
@@ -304,11 +313,16 @@ def test_mcbbs_detect(tmp_path):
     assert MCBBSProvider().detect(p) is True
 
 
-def test_mcbbs_detect_rejects_wrong_manifesttype(tmp_path):
+def test_mcbbs_detect_claims_any_packmeta(tmp_path):
+    """detect() now claims ANY archive carrying mcbbs.packmeta — even a broken one —
+    so an MCBBS pack (which also ships a CF-style manifest.json) never falls through
+    to the CurseForge provider. parse() is where a broken packmeta is explained."""
     p = tmp_path / "bad.zip"
     with zipfile.ZipFile(p, "w") as zf:
         zf.writestr("mcbbs.packmeta", json.dumps({"manifestType": "something_else"}))
-    assert MCBBSProvider().detect(str(p)) is False
+    assert MCBBSProvider().detect(str(p)) is True
+    # and it must win over CurseForge for this archive
+    assert detect_provider(str(p)).name == "mcbbs"
 
 
 def test_mcbbs_parse_splits_addon_and_curse_files(tmp_path):
@@ -337,9 +351,11 @@ def test_mcbbs_apply_handles_curse_without_key(tmp_path, monkeypatch):
         archive_path=p, server_name="srv", parent_dir=str(tmp_path),
         env_manager=FakeEnv(), installer=FakeInstaller(), downloader=FakeDownloader(),
     )
+    # Import succeeds; the un-downloadable curse file is a warning, not a hard error.
+    assert result.success
     assert result.files_failed == 1   # the curse file
     assert (tmp_path / "srv" / "config" / "hello.cfg").exists()  # overrides still applied
-    assert "curseforge_api_key" in (result.error or "")
+    assert any("curseforge_api_key" in w for w in result.warnings)
 
 
 # ---------- mutual exclusion: no provider crosstalk ----------

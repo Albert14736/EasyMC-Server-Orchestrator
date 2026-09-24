@@ -50,12 +50,13 @@ def test_parse_java_major_version_returns_none_on_garbage():
 # ---------- java_major_version_of (subprocess wrapper) ----------
 
 def test_java_major_version_of_uses_stderr(monkeypatch):
-    """`java -version` writes to stderr — make sure we read stderr."""
+    """`java -version` writes to stderr — make sure we read stderr.
+    probe_java runs with capture_output=True, so stderr/stdout come back as bytes."""
     fake = mock.Mock()
-    fake.stderr = 'openjdk version "17.0.2"\n'
-    fake.stdout = ""
+    fake.stderr = b'openjdk version "17.0.2"\n'
+    fake.stdout = b""
     monkeypatch.setattr(env_manager.subprocess, "run", lambda *a, **k: fake)
-    assert java_major_version_of("/fake/java") == 17
+    assert java_major_version_of("/fake/java17-stderr") == 17
 
 
 def test_java_major_version_of_handles_missing_binary(monkeypatch):
@@ -73,78 +74,98 @@ def test_java_major_version_of_handles_timeout(monkeypatch):
     assert java_major_version_of("/slow/java") is None
 
 
-# ---------- Windows finder (mocked, runs on macOS) ----------
+# ---------- Java selection (mocked installed table, runs on any OS) ----------
+# The finder now goes through select_java(list_installed_javas(), required, max_major):
+# exact major first, else the NEAREST HIGHER major in range, never a lower one.
+# We feed the table at the _all_candidates + java_version_of seam.
 
-def _mock_strategies(monkeypatch, java_home=None, registry=(), common=(), where=()):
-    monkeypatch.setattr(env_manager, "_candidates_from_java_home",
-                        lambda: ([java_home] if java_home else []))
-    monkeypatch.setattr(env_manager, "_candidates_from_registry", lambda: list(registry))
-    monkeypatch.setattr(env_manager, "_candidates_from_common_dirs", lambda: list(common))
-    monkeypatch.setattr(env_manager, "_candidates_from_where", lambda: list(where))
+def _mock_installed(monkeypatch, mapping):
+    """mapping: {path: major}. _all_candidates yields the paths; java_version_of
+    maps each to a (major, 0, 0) version tuple."""
+    monkeypatch.setattr(env_manager, "_all_candidates", lambda: list(mapping))
+    monkeypatch.setattr(env_manager, "java_version_of",
+                        lambda p: (mapping[p], 0, 0) if p in mapping else None)
 
 
-def test_find_java_windows_prefers_correct_version(monkeypatch):
-    """When multiple Javas exist, return the one matching `required`."""
-    _mock_strategies(
-        monkeypatch,
-        registry=[r"C:\jdk8\bin\java.exe", r"C:\jdk17\bin\java.exe", r"C:\jdk21\bin\java.exe"],
-    )
-    versions = {
+def test_find_java_prefers_exact_major(monkeypatch):
+    """When multiple Javas exist, return the one whose major matches `required`."""
+    _mock_installed(monkeypatch, {
         r"C:\jdk8\bin\java.exe": 8,
         r"C:\jdk17\bin\java.exe": 17,
         r"C:\jdk21\bin\java.exe": 21,
-    }
-    monkeypatch.setattr(env_manager, "java_major_version_of",
-                        lambda p, timeout=5.0: versions.get(p))
+    })
     assert _find_java_on_windows(17) == r"C:\jdk17\bin\java.exe"
     assert _find_java_on_windows(21) == r"C:\jdk21\bin\java.exe"
     assert _find_java_on_windows(8) == r"C:\jdk8\bin\java.exe"
 
 
-def test_find_java_windows_returns_none_when_version_missing(monkeypatch):
-    _mock_strategies(monkeypatch, registry=[r"C:\jdk17\bin\java.exe"])
-    monkeypatch.setattr(env_manager, "java_major_version_of", lambda p, timeout=5.0: 17)
-    # User asks for 21, only 17 installed — fail (caller can show a helpful error)
+def test_find_java_never_falls_back_to_lower(monkeypatch):
+    """New rule: never return a LOWER major. Ask for 21, only 17 installed -> None."""
+    _mock_installed(monkeypatch, {r"C:\jdk17\bin\java.exe": 17})
     assert _find_java_on_windows(21) is None
 
 
-def test_find_java_windows_dedupes_candidates(monkeypatch):
-    """JAVA_HOME and registry might point at the same install — only check once."""
-    dup_path = r"C:\jdk17\bin\java.exe"
-    _mock_strategies(monkeypatch, java_home=dup_path, registry=[dup_path], where=[dup_path])
-    seen = []
-    def check_version(p, timeout=5.0):
-        seen.append(p)
-        return 17
-    monkeypatch.setattr(env_manager, "java_major_version_of", check_version)
-    _find_java_on_windows(17)
-    assert len(seen) == 1
+def test_find_java_picks_nearest_higher_when_no_exact(monkeypatch):
+    """No exact major -> nearest HIGHER within range, not a lower one."""
+    _mock_installed(monkeypatch, {
+        r"C:\jdk17\bin\java.exe": 17,
+        r"C:\jdk21\bin\java.exe": 21,
+        r"C:\jdk24\bin\java.exe": 24,
+    })
+    # need 18: closest higher is 21 (never 17)
+    assert _find_java_on_windows(18) == r"C:\jdk21\bin\java.exe"
 
 
-def test_find_java_windows_empty_when_no_strategies_hit(monkeypatch):
-    _mock_strategies(monkeypatch)
+def test_select_java_respects_max_major():
+    """max_major caps the nearest-higher search (old Forge/NeoForge reject newer class files)."""
+    from core.env_manager import select_java
+    cands = [(r"C:\jdk17\bin\java.exe", (17, 0, 0)), (r"C:\jdk21\bin\java.exe", (21, 0, 0))]
+    assert select_java(cands, 17, max_major=17) == r"C:\jdk17\bin\java.exe"  # 21 excluded
+    assert select_java(cands, 18, max_major=17) is None                      # nothing in [18,17]
+
+
+def test_select_java_prefers_newest_update_within_major():
+    """Among the same major, pick the newest update (an ancient 8u51 is the worst 8)."""
+    from core.env_manager import select_java
+    cands = [(r"C:\jdk8_51\bin\java.exe", (8, 0, 51)),
+             (r"C:\jdk8_402\bin\java.exe", (8, 0, 402))]
+    assert select_java(cands, 8) == r"C:\jdk8_402\bin\java.exe"
+
+
+def test_find_java_empty_when_nothing_installed(monkeypatch):
+    _mock_installed(monkeypatch, {})
     assert _find_java_on_windows(17) is None
+
+
+def test_all_candidates_dedupes(monkeypatch):
+    """The same install reached via several strategies is collected once."""
+    dup = "/opt/jdk17/bin/java"
+    monkeypatch.setattr(env_manager, "_candidates_from_java_home", lambda: [dup])
+    monkeypatch.setattr(env_manager, "_candidates_on_darwin", lambda: [dup])
+    monkeypatch.setattr(env_manager, "_candidates_from_path", lambda: [dup])
+    monkeypatch.setattr(env_manager, "_candidates_on_linux", lambda: [dup])
+    assert env_manager._all_candidates().count(dup) == 1
 
 
 # ---------- get_java_cmd dispatch ----------
 
 def test_get_java_cmd_falls_back_to_bare_java(monkeypatch):
-    """If platform returns None, we still return 'java' so caller can try PATH."""
+    """Nothing suitable installed -> get_java_cmd still returns 'java' (legacy fallback)."""
     monkeypatch.setattr(env_manager.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(env_manager, "_find_java_on_windows", lambda req: None)
+    _mock_installed(monkeypatch, {})
     assert EnvManager().get_java_cmd(17) == "java"
 
 
 def test_get_java_cmd_returns_found_path(monkeypatch):
     monkeypatch.setattr(env_manager.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(env_manager, "_find_java_on_windows",
-                        lambda req: r"C:\jdk17\bin\java.exe")
+    _mock_installed(monkeypatch, {r"C:\jdk17\bin\java.exe": 17})
     assert EnvManager().get_java_cmd(17) == r"C:\jdk17\bin\java.exe"
 
 
 def test_get_java_cmd_linux_falls_back(monkeypatch):
-    """Linux path uses bare 'java' — we haven't implemented detection there yet."""
+    """Linux with no detectable Java -> bare 'java'."""
     monkeypatch.setattr(env_manager.platform, "system", lambda: "Linux")
+    _mock_installed(monkeypatch, {})
     assert EnvManager().get_java_cmd(17) == "java"
 
 

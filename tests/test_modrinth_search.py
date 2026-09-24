@@ -6,9 +6,11 @@ parsing, sorting/picking logic, and that download_to streams to the right path.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
+import zipfile
 from unittest import mock
 
 import pytest
@@ -26,6 +28,13 @@ class FakeResp:
         self.status_code = status_code
         self._content = content
 
+    # download_to now streams inside `with requests.get(...) as r:`
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
     def raise_for_status(self):
         if 400 <= self.status_code < 600:
             raise __import__("requests").HTTPError(f"status {self.status_code}")
@@ -37,6 +46,14 @@ class FakeResp:
         # yield in chunks of chunk_size
         for i in range(0, len(self._content), chunk_size):
             yield self._content[i:i + chunk_size]
+
+
+def _zip_bytes(name="x.txt", data=b"hi"):
+    """A real zip payload — download_to rejects a .jar that isn't a valid zip."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr(name, data)
+    return buf.getvalue()
 
 
 # ---------- search_mods ----------
@@ -235,7 +252,8 @@ def test_pick_primary_file_returns_none_when_no_files():
 # ---------- download_to ----------
 
 def test_download_to_writes_streamed_bytes(monkeypatch, tmp_path):
-    payload = b"FAKE_JAR_CONTENTS" * 100
+    # a .jar must be a valid zip (download_to verifies the header), so stream a real zip
+    payload = _zip_bytes("mod.class", b"FAKE_JAR_CONTENTS" * 100)
     monkeypatch.setattr(ms.requests, "get",
                         lambda url, stream, headers, timeout: FakeResp(content=payload))
 
@@ -246,10 +264,28 @@ def test_download_to_writes_streamed_bytes(monkeypatch, tmp_path):
 
 def test_download_to_creates_dest_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(ms.requests, "get",
-                        lambda *a, **k: FakeResp(content=b"x"))
+                        lambda *a, **k: FakeResp(content=_zip_bytes()))
     nested = tmp_path / "a" / "b" / "c"
     ms.download_to("https://cdn/f.jar", str(nested), "f.jar")
     assert (nested / "f.jar").exists()
+
+
+def test_download_to_rejects_non_jar_content(tmp_path, monkeypatch):
+    # an HTML error page saved as .jar must be rejected, and no .part left behind
+    monkeypatch.setattr(ms.requests, "get",
+                        lambda *a, **k: FakeResp(content=b"<html>404</html>"))
+    with pytest.raises(ms.ModrinthError):
+        ms.download_to("https://cdn/f.jar", str(tmp_path / "mods"), "bad.jar")
+    assert not (tmp_path / "mods" / "bad.jar").exists()
+    assert not (tmp_path / "mods" / "bad.jar.part").exists()
+
+
+def test_download_to_verifies_sha1(tmp_path, monkeypatch):
+    monkeypatch.setattr(ms.requests, "get",
+                        lambda *a, **k: FakeResp(content=_zip_bytes()))
+    with pytest.raises(ms.ModrinthError):
+        ms.download_to("https://cdn/f.jar", str(tmp_path / "mods"), "x.jar",
+                       sha1="0" * 40)
 
 
 # ---------- is_client_only routing through classify_mod ----------

@@ -52,6 +52,11 @@ class FakeResp:
         self.content = content
         self.status_code = status_code
         self._payload = payload
+    # the downloader streams inside `with requests.get(...) as r:`
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        return False
     def raise_for_status(self):
         if self.status_code >= 400:
             raise __import__("requests").HTTPError(f"status {self.status_code}")
@@ -62,6 +67,37 @@ class FakeResp:
         if self._payload is not None:
             return self._payload
         return __import__("json").loads(self.content.decode())
+
+
+@pytest.fixture(autouse=True)
+def _no_modrinth_network(monkeypatch):
+    """Every test runs offline against Modrinth by default: clear the module-level
+    sha1/slug/title caches and make _ModrinthSides._request a no-op (returns None).
+    Tests that need specific Modrinth answers override by_sha1/by_slugs/by_title
+    (via _mock_sides) or _request itself."""
+    for c in (mp_modrinth._SHA1_CACHE, mp_modrinth._SLUG_CACHE, mp_modrinth._TITLE_CACHE):
+        c.clear()
+    monkeypatch.setattr(mp_modrinth._ModrinthSides, "_request",
+                        lambda self, method, url, **kw: None)
+
+
+def _mock_sides(monkeypatch, by_sha1=None, by_slugs=None, by_title=None):
+    """Replace the batched Modrinth side lookups used to classify bundled/override
+    mod jars. Keys are matched case-insensitively; anything absent resolves to None
+    (unknown -> installed, the safe default)."""
+    sha1_t = {k.lower(): v for k, v in (by_sha1 or {}).items()}
+    slug_t = {k.lower(): v for k, v in (by_slugs or {}).items()}
+    title_t = {k.strip().lower(): v for k, v in (by_title or {}).items()}
+    monkeypatch.setattr(mp_modrinth._ModrinthSides, "by_sha1",
+                        lambda self, sha1s: {s.lower(): sha1_t[s.lower()]
+                                             for s in sha1s
+                                             if isinstance(s, str) and s.lower() in sha1_t})
+    monkeypatch.setattr(mp_modrinth._ModrinthSides, "by_slugs",
+                        lambda self, slugs: {s.lower(): slug_t[s.lower()]
+                                             for s in slugs
+                                             if isinstance(s, str) and s.lower() in slug_t})
+    monkeypatch.setattr(mp_modrinth._ModrinthSides, "by_title",
+                        lambda self, title: title_t.get((title or "").strip().lower()))
 
 
 def _make_index(loader_key="forge", loader_ver="47.2.0", mc_ver="1.20.4",
@@ -145,6 +181,7 @@ def test_parse_picks_forge_loader(tmp_path):
     assert len(m.files) == 1
 
 
+# _pick_loader now returns (loader_name, version, dependency_key)
 @pytest.mark.parametrize("key,expected", [
     ("forge", "Forge"),
     ("neoforge", "NeoForge"),
@@ -153,15 +190,17 @@ def test_parse_picks_forge_loader(tmp_path):
 ])
 def test_loader_key_mapping(key, expected):
     deps = {"minecraft": "1.20.4", key: "1.0"}
-    name, ver = _pick_loader(deps)
+    name, ver, dep_key = _pick_loader(deps)
     assert name == expected
     assert ver == "1.0"
+    assert dep_key == key
 
 
 def test_pick_loader_falls_back_to_paper_for_vanilla():
-    name, ver = _pick_loader({"minecraft": "1.20.4"})
+    name, ver, dep_key = _pick_loader({"minecraft": "1.20.4"})
     assert name == "Paper"
     assert ver is None
+    assert dep_key is None
 
 
 def test_parse_extracts_env_fields(tmp_path):
@@ -404,26 +443,21 @@ def test_enrich_compat_fills_missing_env(tmp_path, monkeypatch):
     # Sanity: env is unset for both
     assert all(f.env_server is None for f in manifest.files)
 
-    # Mock the two batch endpoints
-    def fake_post(url, json, headers, timeout):
-        assert url.endswith("/v2/version_files")
-        return FakeResp(content=__import__("json").dumps({
-            "sha-sodium": {"project_id": "proj-sodium"},
-            "sha-luck": {"project_id": "proj-luck"},
-        }).encode())
-
-    def fake_get(url, params, headers, timeout):
-        assert url.endswith("/v2/projects")
-        return FakeResp(content=__import__("json").dumps([
-            {"id": "proj-sodium", "client_side": "required", "server_side": "unsupported"},
-            {"id": "proj-luck", "client_side": "unsupported", "server_side": "required"},
-        ]).encode())
-
-    monkeypatch.setattr(mp_modrinth.requests, "post", fake_post)
-    monkeypatch.setattr(mp_modrinth.requests, "get", fake_get)
-    # Need to make FakeResp.json() return parsed payload
-    def _json(self): return __import__("json").loads(self.content.decode())
-    monkeypatch.setattr(FakeResp, "json", _json, raising=False)
+    # enrich_compat batches through _ModrinthSides: POST /v2/version_files
+    # (sha1 -> project_id) then GET /v2/projects (project_id -> side metadata).
+    def fake_request(self, method, url, **kw):
+        if url.endswith("/v2/version_files"):
+            return FakeResp(payload={
+                "sha-sodium": {"project_id": "proj-sodium"},
+                "sha-luck": {"project_id": "proj-luck"},
+            })
+        if url.endswith("/v2/projects"):
+            return FakeResp(payload=[
+                {"id": "proj-sodium", "client_side": "required", "server_side": "unsupported"},
+                {"id": "proj-luck", "client_side": "unsupported", "server_side": "required"},
+            ])
+        return None
+    monkeypatch.setattr(mp_modrinth._ModrinthSides, "_request", fake_request)
 
     provider.enrich_compat(manifest)
 
@@ -475,15 +509,13 @@ def test_apply_skips_client_only_override_mods(tmp_path, monkeypatch):
         },
     )
 
-    # Mock the lookup: iris.jar's sha1 → client-only, lithium.jar's sha1 → server-ok
+    # Bundled-jar classification is a batched sha1 lookup now:
+    # iris.jar → client-only, lithium.jar → server-ok.
     from core.mod_scanner import ModInfo
-    def fake_lookup(sha1, timeout=10.0):
-        if sha1 == client_sha1:
-            return ModInfo("p1", "Iris", client_side="required", server_side="unsupported")
-        if sha1 == server_sha1:
-            return ModInfo("p2", "Lithium", client_side="optional", server_side="optional")
-        return None
-    monkeypatch.setattr("core.modpack.modrinth.lookup_mod_by_sha1", fake_lookup)
+    _mock_sides(monkeypatch, by_sha1={
+        client_sha1: ModInfo("p1", "Iris", client_side="required", server_side="unsupported"),
+        server_sha1: ModInfo("p2", "Lithium", client_side="optional", server_side="optional"),
+    })
 
     result = import_modpack(
         archive_path=pack, server_name="srv", parent_dir=str(tmp_path),
@@ -538,14 +570,14 @@ def test_exact_title_search_rejects_partial_match(monkeypatch):
     """'Catalogue' must NOT match 'The Mandela Catalogue: Alternates'."""
     from core.modpack.modrinth import _lookup_modrinth_project_by_exact_title
 
-    def fake_get(url, params, headers, timeout):
+    def fake_request(self, method, url, **kw):
         return FakeResp(payload={"hits": [
             {"title": "The Mandela Catalogue: Alternates",
              "project_id": "x", "client_side": "required", "server_side": "required"},
             {"title": "Some other thing",
              "project_id": "y", "client_side": "required", "server_side": "unsupported"},
         ]})
-    monkeypatch.setattr(mp_modrinth.requests, "get", fake_get)
+    monkeypatch.setattr(mp_modrinth._ModrinthSides, "_request", fake_request)
     # Returns None — no exact title match
     assert _lookup_modrinth_project_by_exact_title("Catalogue") is None
 
@@ -553,14 +585,14 @@ def test_exact_title_search_rejects_partial_match(monkeypatch):
 def test_exact_title_search_accepts_exact_match(monkeypatch):
     from core.modpack.modrinth import _lookup_modrinth_project_by_exact_title
 
-    def fake_get(url, params, headers, timeout):
+    def fake_request(self, method, url, **kw):
         return FakeResp(payload={"hits": [
             {"title": "Sodium Unrelated", "project_id": "a",
              "client_side": "required", "server_side": "required"},
             {"title": "CIT Resewn", "project_id": "b",
              "client_side": "required", "server_side": "unsupported"},
         ]})
-    monkeypatch.setattr(mp_modrinth.requests, "get", fake_get)
+    monkeypatch.setattr(mp_modrinth._ModrinthSides, "_request", fake_request)
     info = _lookup_modrinth_project_by_exact_title("cit resewn")  # case insensitive
     assert info is not None
     assert info.project_id == "b"
@@ -582,15 +614,12 @@ def test_override_jar_uses_slug_fallback_when_sha1_misses(tmp_path, monkeypatch)
         extra_files={"overrides/mods/catalogue-1.8.0.jar": catalogue_bytes},
     )
 
-    # sha1 lookup fails (Modrinth doesn't have this exact build), but slug lookup
-    # returns catalogue's project metadata (client-only).
-    monkeypatch.setattr("core.modpack.modrinth.lookup_mod_by_sha1",
-                        lambda sha1, timeout=10.0: None)
-    monkeypatch.setattr("core.modpack.modrinth._lookup_modrinth_project_by_slug",
-                        lambda slug, timeout=8.0:
-                            ModInfo("p", "Catalogue", client_side="required",
-                                    server_side="unsupported")
-                            if slug == "catalogue" else None)
+    # sha1 lookup misses (Modrinth doesn't have this exact build), but the slug
+    # lookup (from the jar's modId 'catalogue') returns client-only metadata.
+    _mock_sides(monkeypatch,
+                by_sha1={},
+                by_slugs={"catalogue": ModInfo("p", "Catalogue", client_side="required",
+                                               server_side="unsupported")})
 
     result = import_modpack(
         archive_path=pack, server_name="srv", parent_dir=str(tmp_path),
@@ -610,8 +639,7 @@ def test_apply_keeps_override_mods_when_lookup_fails(tmp_path, monkeypatch):
         extra_files={"overrides/mods/mystery.jar": jar_bytes},
     )
 
-    monkeypatch.setattr("core.modpack.modrinth.lookup_mod_by_sha1",
-                        lambda sha1, timeout=10.0: None)  # not on Modrinth
+    _mock_sides(monkeypatch)  # nothing found on Modrinth (sha1/slug/title all miss)
 
     result = import_modpack(
         archive_path=pack, server_name="srv", parent_dir=str(tmp_path),

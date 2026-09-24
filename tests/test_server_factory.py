@@ -33,6 +33,23 @@ class FakeEnv:
         return f"/fake/java{version}/bin/java"
 
 
+def _write_forge_layout(path, group="net/minecraftforge", artifact="forge", ver="1.20.4-49.0.0"):
+    """Fake what a Forge/NeoForge installer leaves on disk: run.sh/run.bat delegating
+    to argfiles under libraries/, plus user_jvm_args.txt. No server.jar — HMSL now
+    launches java directly with @user_jvm_args.txt @.../unix_args.txt (not via run.sh)."""
+    rel = f"libraries/{group}/{artifact}/{ver}"
+    os.makedirs(os.path.join(path, rel), exist_ok=True)
+    for name in ("unix_args.txt", "win_args.txt"):
+        with open(os.path.join(path, rel, name), "w") as f:
+            f.write("-p\nlibraries\n-DlaunchTarget forgeserver\n")
+    with open(os.path.join(path, "user_jvm_args.txt"), "w") as f:
+        f.write("# Xmx etc. go here\n")
+    with open(os.path.join(path, "run.sh"), "w") as f:
+        f.write(f'#!/bin/sh\njava @user_jvm_args.txt @{rel}/unix_args.txt "$@"\n')
+    with open(os.path.join(path, "run.bat"), "w") as f:
+        f.write(f'@echo off\njava @user_jvm_args.txt @{rel}/win_args.txt %*\n')
+
+
 class FakeInstaller:
     """Records which installer method was called and always succeeds by default."""
 
@@ -56,16 +73,22 @@ class FakeInstaller:
             self._write_jar(path)
         return self.succeed
 
+    def install_vanilla(self, path, version):
+        self.calls.append(("vanilla", path, version))
+        if self.succeed:
+            self._write_jar(path)
+        return self.succeed
+
     def install_forge(self, path, version, java_cmd):
         self.calls.append(("forge", path, version, java_cmd))
         if self.succeed:
-            self._write_jar(path)
+            _write_forge_layout(path, "net/minecraftforge", "forge")
         return self.succeed
 
     def install_neoforge(self, path, version, java_cmd):
         self.calls.append(("neoforge", path, version, java_cmd))
         if self.succeed:
-            self._write_jar(path)
+            _write_forge_layout(path, "net/neoforged", "neoforge")
         return self.succeed
 
 
@@ -127,8 +150,9 @@ def test_create_server_paper_writes_plugins_dir(tmp_path):
     # Java 17 for 1.20.4
     assert env.calls == [17]
     # Progress should run 0 → 1, monotonically non-decreasing
+    # (create_server now opens with a 0.05 "finding Java" step before 0.10)
     fractions = [f for f, _ in progress]
-    assert fractions[0] >= 0.10
+    assert 0.0 <= fractions[0] <= 0.10
     assert fractions[-1] == 1.0
     assert fractions == sorted(fractions)
 
@@ -192,8 +216,10 @@ def test_create_server_writes_platform_launch_script(tmp_path):
         assert "server.jar" in body
 
 
-def test_forge_launch_script_delegates_to_run_sh(tmp_path):
-    """Forge has no server.jar — start.sh must delegate to Forge's run.sh."""
+def test_forge_launch_script_uses_argfile(tmp_path):
+    """Forge has no server.jar. HMSL now launches java directly with the installer's
+    argfiles (@user_jvm_args.txt @libraries/.../unix_args.txt) — it does NOT delegate
+    to run.sh/run.bat anymore (that shell layer caused the console/orphan issues)."""
     env, inst, dl = FakeEnv(), FakeInstaller(), FakeDownloader()
     create_server(
         name="forge_srv", version="1.20.4", loader="Forge",
@@ -203,16 +229,22 @@ def test_forge_launch_script_delegates_to_run_sh(tmp_path):
     server = tmp_path / "forge_srv"
     if sys.platform == "win32":
         body = (server / "start.bat").read_text()
-        assert "run.bat" in body
-        assert "server.jar" not in body
+        assert "@user_jvm_args.txt" in body and "win_args.txt" in body
+        assert "call run.bat" not in body
     else:
         body = (server / "start.sh").read_text()
-        assert "run.sh" in body
-        assert "server.jar" not in body
+        assert "@user_jvm_args.txt" in body and "unix_args.txt" in body
+        assert "run.sh" not in body          # java is launched directly, no delegation
+    assert "server.jar" not in body
+    assert "nogui" in body
+    # hmsl_launch.json records the same argfile-based launch
+    import json
+    spec = json.load(open(server / "hmsl_launch.json", encoding="utf-8-sig"))
+    assert any("user_jvm_args.txt" in a for a in spec["launch_args"]["unix"])
 
 
-def test_neoforge_launch_script_delegates_to_run_sh(tmp_path):
-    """Same as Forge — NeoForge also ships its own run.sh, no server.jar."""
+def test_neoforge_launch_script_uses_argfile(tmp_path):
+    """Same as Forge — NeoForge ships argfiles under libraries/net/neoforged, no server.jar."""
     env, inst, dl = FakeEnv(), FakeInstaller(), FakeDownloader()
     create_server(
         name="neo_srv", version="1.20.4", loader="NeoForge",
@@ -222,8 +254,9 @@ def test_neoforge_launch_script_delegates_to_run_sh(tmp_path):
     server = tmp_path / "neo_srv"
     script = server / ("start.bat" if sys.platform == "win32" else "start.sh")
     body = script.read_text()
-    assert "run." in body  # delegates to run.sh / run.bat
+    assert "@user_jvm_args.txt" in body
     assert "server.jar" not in body
+    assert "nogui" in body
 
 
 # ---------- create_server error paths ----------
